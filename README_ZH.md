@@ -288,6 +288,16 @@ dns:
 - `multi-port`：每个节点一个独立本地 HTTP/SOCKS5 端口。
 - `hybrid`：同时启用 pool + multi-port。
 
+## 出口信息与风险查询
+
+系统设置新增 IPinfo 和 AbuseIPDB key 列表，每行一个，保存至 `config.yaml` 的 `ip_metadata.ipinfo_keys` 和 `ip_metadata.abuseipdb_keys`。配置文件包含凭据，请限制访问。IPinfo Lite 通过每个节点访问 `/lite/me`，国家、ASN 和组织以它为准；没有 key 或 key 均不可用时回退至 ipwho.is，再尝试 ipapi.co。两家查询各串行执行，复用 HTTP 连接，认证或配额失败自动切换 key 并冷却。
+
+AbuseIPDB 没有 key 时不请求。出口发现后，排除 Amazon、Microsoft、Oracle、Google、OVH、GTHost、Melbikomas、Alibaba、Tencent、Greenhost、DigitalOcean、M247、Datacamp、Contabo、ByteVirt、VMISS 及组织名包含 host/cloud 的节点，其他节点查询使用类型和最近 90 天的风险分数。被排除的节点在实际代理连接成功使用后才查询。每个稳定节点身份在进程生命周期内只进行一次逻辑查询，故障 key 可在该次查询中轮换；相同出口 IP 共享成功结果，订阅刷新和核心重载不会重复查询。取消中的查询可以重试，程序重启会清空内存缓存。
+
+显示和导出名称为 `ISP|分数|国家代码|出口IP|org简称|原名`，未确认 ISP 或没有分数时省略对应字段，0 分会保留。只有 `Fixed Line ISP` 和 `Mobile ISP` 才加 ISP 前缀；原始配置名称不覆盖。API 保留完整 usageType、ISP、举报数量、不同举报人数量、最后举报时间、域名和 isTor。AbuseIPDB 不提供独立 VPN/代理判定，缺失信息保持未知，也不覆盖 IPinfo 的国家和组织。运营商简称字段为 `org_short`，完整名称仍在 `provider`。
+
+订阅支持 `/sub/proxies?n=isp`（含固定宽带及移动 ISP），也可指定 `n=mobile`、`n=hosting`、`n=unknown`，与 `c` 国家和 `t` 协议组合，例如 `/sub/proxies?c=GB,DE&n=isp&t=vless`。未知类型不会被 `n=isp` 返回。IP 数据来源：[IPinfo](https://ipinfo.io/)。
+
 ## 节点来源行为
 
 - 配置了 `subscriptions` 时：

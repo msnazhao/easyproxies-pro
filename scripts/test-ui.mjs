@@ -92,3 +92,13 @@ test('disabled GeoIP zero interval loads a valid default without blocking settin
  await f.run('loadSettingsPage()');assert.equal(f.run('settingsLoaded'),true);assert.equal(f.element('settingGeoIPUpdateInterval').value,'24h');
  interval='6h';await f.run('loadSettingsPage()');assert.equal(f.element('settingGeoIPUpdateInterval').value,'6h');
 });
+
+test('API keys load and changing only keys is detected by settings save',async()=>{
+ const f=await fixture();
+ f.context.fetch=async(path)=>new Response(JSON.stringify(path==='/api/settings'?{ip_metadata:{ipinfo_keys:['test-a','test-b'],abuseipdb_keys:['test-c']}}:{enabled:false,interval:'1h',subscriptions:[]}));
+ await f.run('loadSettingsPage()');
+ assert.equal(f.element('settingIPinfoKeys').value,'test-a\ntest-b');
+ assert.equal(f.element('settingAbuseKeys').value,'test-c');
+ const before=f.run('_buildCoreSnapshot()');f.element('settingIPinfoKeys').value='replacement';
+ assert.notEqual(f.run('_buildCoreSnapshot()'),before);
+});

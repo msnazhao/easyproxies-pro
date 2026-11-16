@@ -19,11 +19,13 @@ import (
 	"sync"
 	"time"
 
+	"easy_proxies/internal/ipmeta"
 	"gopkg.in/yaml.v3"
 )
 
 // Config describes the high level settings for the proxy pool server.
 type Config struct {
+	IPMetadata          ipmeta.Config             `yaml:"ip_metadata"`
 	Mode                string                    `yaml:"mode"`
 	Listener            ListenerConfig            `yaml:"listener"`
 	MultiPort           MultiPortConfig           `yaml:"multi_port"`
@@ -2024,7 +2026,7 @@ func (c *Config) SettingsSnapshot() Config {
 	return Config{
 		Mode: c.Mode, Listener: c.Listener, MultiPort: c.MultiPort, Pool: c.Pool,
 		Sticky: c.Sticky, Management: c.Management, ExternalIP: c.ExternalIP,
-		SkipCertVerify: c.SkipCertVerify, Log: c.Log, GeoIP: c.GeoIP,
+		SkipCertVerify: c.SkipCertVerify, Log: c.Log, GeoIP: c.GeoIP, IPMetadata: c.IPMetadata,
 		filePath: c.filePath,
 	}
 }
@@ -2072,6 +2074,7 @@ func (c *Config) saveSettings(includeSubscriptions bool) error {
 			saveCfg.SubscriptionRefresh = c.SubscriptionRefresh
 		}
 		saveCfg.GeoIP = c.GeoIP
+		saveCfg.IPMetadata = c.IPMetadata
 		saveCfg.Mode = c.Mode
 		saveCfg.Listener = c.Listener
 		saveCfg.MultiPort = c.MultiPort

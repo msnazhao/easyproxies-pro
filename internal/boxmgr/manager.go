@@ -826,6 +826,9 @@ func (m *Manager) ensureMonitor(ctx context.Context) error {
 		return fmt.Errorf("init monitor manager: %w", err)
 	}
 	monitorMgr.SetLogger(monitorLoggerAdapter{logger: m.logger})
+	if m.cfg != nil {
+		monitorMgr.Metadata.Configure(m.cfg.IPMetadata)
+	}
 	m.monitorMgr = monitorMgr
 
 	var serverToStart *monitor.Server

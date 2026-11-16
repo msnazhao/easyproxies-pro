@@ -2,6 +2,7 @@ package monitor
 
 import (
 	"context"
+	"easy_proxies/internal/ipmeta"
 	"errors"
 	"fmt"
 	"net"
@@ -30,19 +31,25 @@ type Config struct {
 
 // NodeInfo is static metadata about a proxy entry.
 type NodeInfo struct {
-	Tag           string `json:"tag"`
-	Name          string `json:"name"`
-	URI           string `json:"uri"`
-	Mode          string `json:"mode"`
-	ListenAddress string `json:"listen_address,omitempty"`
-	Port          uint16 `json:"port,omitempty"`
-	Region        string `json:"region,omitempty"`  // Region code derived from the measured exit IP.
-	Country       string `json:"country,omitempty"` // Full country name from GeoIP
-	EntryCountry  string `json:"entry_country,omitempty"`
-	EntryISO      string `json:"entry_iso,omitempty"`
-	ExitIP        string `json:"exit_ip,omitempty"`
-	Provider      string `json:"provider,omitempty"`
-	CountryCode   string `json:"country_code,omitempty"`
+	OriginalName  string        `json:"original_name,omitempty"`
+	ASN           string        `json:"asn,omitempty"`
+	OrgDomain     string        `json:"org_domain,omitempty"`
+	OrgShort      string        `json:"org_short,omitempty"`
+	NetworkType   string        `json:"network_type,omitempty"`
+	Abuse         *ipmeta.Abuse `json:"abuse,omitempty"`
+	Tag           string        `json:"tag"`
+	Name          string        `json:"name"`
+	URI           string        `json:"uri"`
+	Mode          string        `json:"mode"`
+	ListenAddress string        `json:"listen_address,omitempty"`
+	Port          uint16        `json:"port,omitempty"`
+	Region        string        `json:"region,omitempty"`  // Region code derived from the measured exit IP.
+	Country       string        `json:"country,omitempty"` // Full country name from GeoIP
+	EntryCountry  string        `json:"entry_country,omitempty"`
+	EntryISO      string        `json:"entry_iso,omitempty"`
+	ExitIP        string        `json:"exit_ip,omitempty"`
+	Provider      string        `json:"provider,omitempty"`
+	CountryCode   string        `json:"country_code,omitempty"`
 }
 
 // TimelineEvent represents a single usage event for debug tracking.
@@ -90,30 +97,35 @@ type EntryHandle struct {
 }
 
 type entry struct {
-	info             NodeInfo
-	failure          int
-	success          int64
-	timeline         []TimelineEvent
-	blacklist        bool
-	until            time.Time
-	lastError        string
-	lastFail         time.Time
-	lastOK           time.Time
-	lastProbe        time.Duration
-	active           atomic.Int32
-	probe            probeFunc
-	probeRun         *probeRun
-	probeGeneration  uint64
-	exitPending      bool
-	release          releaseFunc
-	blacklistFn      func(time.Duration)
-	initialCheckDone bool
-	available        bool
-	mu               sync.RWMutex
+	metadataPending   bool
+	metadataUsed      bool
+	metadataVersion   uint64
+	metadataUsageDone bool
+	info              NodeInfo
+	failure           int
+	success           int64
+	timeline          []TimelineEvent
+	blacklist         bool
+	until             time.Time
+	lastError         string
+	lastFail          time.Time
+	lastOK            time.Time
+	lastProbe         time.Duration
+	active            atomic.Int32
+	probe             probeFunc
+	probeRun          *probeRun
+	probeGeneration   uint64
+	exitPending       bool
+	release           releaseFunc
+	blacklistFn       func(time.Duration)
+	initialCheckDone  bool
+	available         bool
+	mu                sync.RWMutex
 }
 
 // Manager aggregates all node states for the UI/API.
 type Manager struct {
+	Metadata         *ipmeta.Service
 	cfg              Config
 	probeDst         M.Socksaddr
 	probeHost        string // probe target hostname (TLS SNI when probeTLS is true)
@@ -218,6 +230,7 @@ func resolveProbeTarget(probeTarget string) (dst M.Socksaddr, host string, useTL
 func NewManager(cfg Config) (*Manager, error) {
 	ctx, cancel := context.WithCancel(context.Background())
 	m := &Manager{
+		Metadata:         ipmeta.New(),
 		cfg:              cfg,
 		nodes:            make(map[string]*entry),
 		ctx:              ctx,
@@ -466,6 +479,9 @@ func (m *Manager) runProbeSweep(timeout time.Duration) {
 func (m *Manager) Stop() {
 	if m.cancel != nil {
 		m.cancel()
+	}
+	if m.Metadata != nil {
+		m.Metadata.Close()
 	}
 }
 

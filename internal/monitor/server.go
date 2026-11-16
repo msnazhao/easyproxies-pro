@@ -24,6 +24,7 @@ import (
 
 	"easy_proxies/internal/config"
 	"easy_proxies/internal/geoip"
+	"easy_proxies/internal/ipmeta"
 	"easy_proxies/internal/routing"
 )
 
@@ -222,6 +223,9 @@ func (s *Server) SetConfig(cfg *config.Config) {
 	// fields owned by the node/subscription lifecycle here.
 	s.cfgSrc = cfg
 	if cfg != nil {
+		if s.mgr != nil && s.mgr.Metadata != nil {
+			s.mgr.Metadata.Configure(cfg.IPMetadata)
+		}
 		s.setPasswordLocked(cfg.Management.Password)
 		s.cfg.ExternalIP = cfg.ExternalIP
 		s.cfg.ProbeTarget = cfg.Management.ProbeTarget
@@ -1020,6 +1024,7 @@ func (s *Server) handleSettings(w http.ResponseWriter, r *http.Request) {
 				"password":          cfg.Management.Password,
 				"probe_concurrency": cfg.ProbeConcurrencyOrDefault(),
 			}
+			resp["ip_metadata"] = cfg.IPMetadata
 			resp["geoip"] = map[string]any{
 				"enabled":              cfg.GeoIP.Enabled,
 				"database_path":        cfg.GeoIP.DatabasePath,
@@ -1032,10 +1037,11 @@ func (s *Server) handleSettings(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, resp)
 	case http.MethodPut:
 		var req struct {
-			ExternalIP     *string `json:"external_ip"`
-			ProbeTarget    *string `json:"probe_target"`
-			SkipCertVerify *bool   `json:"skip_cert_verify"`
-			Mode           string  `json:"mode,omitempty"`
+			IPMetadata     *ipmeta.Config `json:"ip_metadata"`
+			ExternalIP     *string        `json:"external_ip"`
+			ProbeTarget    *string        `json:"probe_target"`
+			SkipCertVerify *bool          `json:"skip_cert_verify"`
+			Mode           string         `json:"mode,omitempty"`
 			Listener       *struct {
 				Address  string `json:"address"`
 				Port     uint16 `json:"port"`
@@ -1253,6 +1259,9 @@ func (s *Server) handleSettings(w http.ResponseWriter, r *http.Request) {
 				candidate.GeoIP.DatabasePath = "./GeoLite2-Country.mmdb"
 			}
 		}
+		if req.IPMetadata != nil {
+			candidate.IPMetadata = *req.IPMetadata
+		}
 		if err := candidate.ValidateManagementSettings(); err != nil {
 			s.cfgMu.Unlock()
 			writeStatusJSON(w, http.StatusBadRequest, map[string]any{"error": err.Error()})
@@ -1271,6 +1280,10 @@ func (s *Server) handleSettings(w http.ResponseWriter, r *http.Request) {
 		s.cfgSrc.SkipCertVerify = candidate.SkipCertVerify
 		s.cfgSrc.Log = candidate.Log
 		s.cfgSrc.GeoIP = candidate.GeoIP
+		s.cfgSrc.IPMetadata = candidate.IPMetadata
+		if s.mgr != nil && s.mgr.Metadata != nil {
+			s.mgr.Metadata.Configure(candidate.IPMetadata)
+		}
 		s.cfgSrc.Mode = candidate.Mode
 		s.cfgSrc.Listener = candidate.Listener
 		s.cfgSrc.MultiPort = candidate.MultiPort

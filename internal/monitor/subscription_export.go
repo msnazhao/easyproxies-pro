@@ -46,6 +46,11 @@ func (s *Server) handleProxySubscription(w http.ResponseWriter, r *http.Request)
 		}
 	}
 	format := strings.ToLower(strings.TrimSpace(r.URL.Query().Get("f")))
+	network := strings.ToLower(strings.TrimSpace(r.URL.Query().Get("n")))
+	if network != "" && network != "isp" && network != "mobile" && network != "hosting" && network != "unknown" {
+		http.Error(w, "n must be isp, mobile, hosting or unknown", http.StatusBadRequest)
+		return
+	}
 	if format == "" {
 		format = "v2ray"
 	}
@@ -57,6 +62,9 @@ func (s *Server) handleProxySubscription(w http.ResponseWriter, r *http.Request)
 	// qualify for a country-specific subscription.
 	var nodes []Snapshot
 	for _, node := range s.mgr.SnapshotFiltered(true) {
+		if network != "" && node.NetworkType != network && !(network == "isp" && node.NetworkType == "mobile") && !(network == "unknown" && node.NetworkType == "") {
+			continue
+		}
 		protocol, _, _ := strings.Cut(strings.ToLower(node.URI), "://")
 		if protocol == "hy2" {
 			protocol = "hysteria2"
@@ -75,7 +83,7 @@ func (s *Server) handleProxySubscription(w http.ResponseWriter, r *http.Request)
 			scheme, _, _ := strings.Cut(strings.ToLower(node.URI), "://")
 			switch scheme {
 			case "vmess", "vless", "trojan", "ss", "ssr", "hysteria2", "hy2", "tuic":
-				links = append(links, node.URI)
+				links = append(links, namedURI(node.URI, node.Name))
 			}
 		}
 		if len(links) == 0 {
@@ -99,6 +107,9 @@ func (s *Server) handleProxySubscription(w http.ResponseWriter, r *http.Request)
 	tags := make([]string, 0, len(nodes))
 	for i, node := range nodes {
 		tag := fmt.Sprintf("node-%d", i+1)
+		if node.Name != "" {
+			tag = fmt.Sprintf("%s [%d]", node.Name, i+1)
+		}
 		converted, err := converter(tag, node.URI, skipCert)
 		if err != nil || !json.Valid(converted) {
 			continue

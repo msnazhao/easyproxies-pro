@@ -397,6 +397,7 @@ func (p *poolOutbound) DialContext(ctx context.Context, network string, destinat
 			p.logger.Info("dial succeeded via ", member.tag, " after ", attempt, " attempts")
 		}
 		p.recordSuccess(member)
+		p.enrichExit(member, true)
 		if lease != nil && network == N.NetworkTCP {
 			meta := p.options.Metadata[member.tag]
 			reason := "node_unavailable"
@@ -491,6 +492,7 @@ func (p *poolOutbound) ListenPacket(ctx context.Context, destination M.Socksaddr
 			p.logger.Info("listen-packet succeeded via ", member.tag, " after ", attempt, " attempts")
 		}
 		p.recordSuccess(member)
+		p.enrichExit(member, true)
 		return p.wrapPacketConn(conn, member), nil
 	}
 	if lastErr == nil {
@@ -1104,8 +1106,11 @@ func (p *poolOutbound) probeMember(ctx context.Context, member *memberState, des
 			case <-p.ctx.Done():
 				return
 			}
-			if ip, iso, country, provider, lookupErr := lookupExit(p.ctx, member.outbound); lookupErr == nil {
+			if ip, iso, country, provider, lookupErr := p.lookupExit(member); lookupErr == nil {
 				entry.SetExit(ip, iso, country, geoip.RegionForISO(iso), provider)
+				if p.monitor != nil {
+					p.monitor.EnrichExit(p.ctx, entry, false)
+				}
 			} else if count := exitLookupErrors.Add(1); count <= 5 {
 				log.Printf("[pool] exit lookup failed for %s: %v", member.tag, lookupErr)
 			} else if count == 6 {

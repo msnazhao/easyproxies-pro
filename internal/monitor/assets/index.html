@@ -943,6 +943,13 @@
             </div>
 
             <div class="panel" style="margin-bottom: 16px;">
+              <div class="panel-header"><div class="panel-title">IP 查询 API</div></div>
+              <div style="padding:16px;display:grid;gap:16px;">
+                <div class="form-group"><label for="settingIPinfoKeys">IPinfo keys (每行一个)</label><textarea id="settingIPinfoKeys" class="setting-input" rows="3" spellcheck="false" autocomplete="off"></textarea></div>
+                <div class="form-group"><label for="settingAbuseKeys">AbuseIPDB keys (每行一个)</label><textarea id="settingAbuseKeys" class="setting-input" rows="3" spellcheck="false" autocomplete="off"></textarea></div>
+              </div>
+            </div>
+            <div class="panel" style="margin-bottom:16px;">
               <div class="panel-header"><div class="panel-title">GeoIP 地域路由</div></div>
               <div style="padding: 16px;">
                 <div class="checkbox-grid">
@@ -1647,7 +1654,7 @@
 
         return `<tr>
           <td><span class="badge ${badge}" title="${escapeHtml(n.last_error || statusText)}">${statusText}</span></td>
-          <td><div class="cell-trunc" title="${escapeHtml(n.exit_ip || '出口待检测')}">${escapeHtml(n.exit_ip ? ((n.entry_iso && n.country_code && n.entry_iso !== n.country_code ? n.entry_iso + ' → ' : '') + (n.country_code || n.country || '未知')) : '待检测')}</div><div class="cell-trunc" style="font-size:11px;color:var(--text-muted)" title="${escapeHtml(n.provider || '')}">${escapeHtml(n.provider || '-')}</div></td>
+          <td><div class="cell-trunc" title="${escapeHtml(n.exit_ip || '出口待检测')}">${escapeHtml(n.exit_ip ? ((n.entry_iso && n.country_code && n.entry_iso !== n.country_code ? n.entry_iso + ' → ' : '') + (n.country_code || n.country || '未知')) : '待检测')}</div><div class="cell-trunc" style="font-size:11px;color:var(--text-muted)" title="${escapeHtml([n.provider, n.asn, n.org_domain, n.abuse?.usageType, n.abuse?.abuseConfidenceScore != null ? 'Abuse: '+n.abuse.abuseConfidenceScore : '', n.abuse?.isTor != null ? 'Tor: '+n.abuse.isTor : ''].filter(Boolean).join(' | '))}">${escapeHtml(n.org_short || n.provider || '-')}</div></td>
           <td class="tt-mono" style="overflow-wrap:anywhere">${escapeHtml(n.exit_ip || '-')}</td>
           <td>
             <div class="cell-trunc" style="font-weight: 500" title="${escapeHtml(n.name || n.tag)}">${escapeHtml(n.name || n.tag)}</div>
@@ -2150,6 +2157,8 @@
         document.getElementById('settingProbeConcurrency').value = mgmt.probe_concurrency || 32;
         // GeoIP
         const geo = d.geoip || {};
+        document.getElementById('settingIPinfoKeys').value = ((d.ip_metadata || {}).ipinfo_keys || []).join('\n');
+        document.getElementById('settingAbuseKeys').value = ((d.ip_metadata || {}).abuseipdb_keys || []).join('\n');
         document.getElementById('settingGeoIPEnabled').checked = geo.enabled || false;
         document.getElementById('settingGeoIPDBPath').value = geo.database_path || '';
         document.getElementById('settingGeoIPListen').value = geo.listen || '';
@@ -2213,6 +2222,8 @@
         mgmt_listen: document.getElementById('settingMgmtListen').value,
         mgmt_password: document.getElementById('settingMgmtPassword').value,
         mgmt_probe_concurrency: document.getElementById('settingProbeConcurrency').value,
+        ipinfo_keys: document.getElementById('settingIPinfoKeys').value,
+        abuseipdb_keys: document.getElementById('settingAbuseKeys').value,
         geoip_enabled: document.getElementById('settingGeoIPEnabled').checked,
         geoip_db: document.getElementById('settingGeoIPDBPath').value,
         geoip_listen: document.getElementById('settingGeoIPListen').value,
@@ -2299,6 +2310,10 @@
             max_backups: parseInt(document.getElementById('settingLogMaxBackups').value) || 3,
             max_age: parseInt(document.getElementById('settingLogMaxAge').value) || 7,
             compress: document.getElementById('settingLogCompress').checked,
+          },
+          ip_metadata: {
+            ipinfo_keys: document.getElementById('settingIPinfoKeys').value.split(/\r?\n/).map(k=>k.trim()).filter(Boolean),
+            abuseipdb_keys: document.getElementById('settingAbuseKeys').value.split(/\r?\n/).map(k=>k.trim()).filter(Boolean),
           },
           geoip: {
             enabled: document.getElementById('settingGeoIPEnabled').checked,

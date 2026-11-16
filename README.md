@@ -285,12 +285,28 @@ Use a proxy-specific header facility instead.
 
 ### How It Works
 
-1. On the first successful health check, each node's public exit IP is measured through that node and looked up in the MaxMind GeoLite2-Country database; the server IP is kept as entry-location diagnostics only
+1. On the first successful health check, each node's public exit IP is measured through that node using IPinfo Lite when configured, with ipwho.is as fallback; the server IP is kept as entry-location diagnostics only
 2. Region filters and per-region pools (`pool-jp`, `pool-kr`, `pool-us`, etc.) use the measured exit country; an unmeasured exit is not assigned to a country
 3. The GeoIP router listens on its own port and selects a region from a proxy request header
 4. Matching requests are routed through the corresponding region pool; unmatched requests use the global pool
 5. Each region pool uses the same scheduling algorithm configured in the `pool` section
 6. DNS lookup results are cached to avoid repeated resolution on reload
+
+## Exit Metadata
+
+The settings page accepts multiple IPinfo and AbuseIPDB keys, one per line. They are saved in `config.yaml`; keep that file private. Example (replace placeholders):
+
+```yaml
+ip_metadata:
+  ipinfo_keys: [YOUR_IPINFO_TOKEN]
+  abuseipdb_keys: [YOUR_ABUSEIPDB_KEY]
+```
+
+IPinfo Lite is authoritative for country, ASN and organization. Its `/lite/me` request travels through the node itself. Missing/unavailable IPinfo keys fall back to ipwho.is (then ipapi.co). Each provider has a separate single-request lane, HTTP keep-alive, key failover, and cooldown on authentication/quota failures. AbuseIPDB is disabled without keys. It checks non-hosting organizations after exit discovery; known hosting providers are checked only after real traffic successfully uses the node. Checks use 90 days of reports, share results for identical exit IPs, and are attempted once per stable node identity during the process lifetime, including subscription refreshes/core reloads. Cancellation permits a later attempt. Restarting the process clears this in-memory cache.
+
+Node display/export names are `ISP|score|country-code|exit-IP|short-org|original-name`, omitting the ISP marker and score when unavailable. Zero is a valid score. Only AbuseIPDB `Fixed Line ISP`/`Mobile ISP` usage types qualify for the ISP marker. Its score is report confidence (0-100), not a probability of maliciousness; `isTor` is kept separately. This API supplies no definitive VPN/proxy flags, so these remain unknown. Country and organization are never overwritten by AbuseIPDB. Original names/URIs remain intact in configuration, and names are recomputed without accumulating prefixes.
+
+Subscriptions support `/sub/proxies?n=isp` (fixed and mobile ISP), `n=mobile`, `n=hosting`, or `n=unknown`, combined with existing country/protocol filters, e.g. `/sub/proxies?c=GB,DE&n=isp&t=vless`. Exports include the enriched display names. Unclassified nodes are excluded from `n=isp`. Location data is provided by [IPinfo](https://ipinfo.io/).
 
 ## Supported Protocols
 
