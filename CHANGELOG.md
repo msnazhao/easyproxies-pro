@@ -5,7 +5,19 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [26.11.16] - 2026-11-16
+
+### Added
+- Build Linux amd64 and arm64 binaries in CI and upload them as workflow artifacts.
+- Export healthy proxies through `/sub/proxies` in V2Ray-compatible or sing-box formats, with country and protocol filters.
+- Display measured exit IP, country, and provider; show entry-to-exit countries for transit nodes.
+- Add fastest-healthy session routing with optional exit-country selection.
+
+### Changed
+- Require Go 1.26.11 and upgrade `brotli` and `klauspost/compress` to patched releases after reachable vulnerability checks identified affected versions.
+- Use strict HTTPS health checks by default and keep failed nodes out of service.
+- Improve balance-mode rotation across distinct exits and nodes sharing an exit.
+- Improve node monitoring search for transit-country routes and expose exit IPs.
 
 ## [3.3.0] - 2026-10-25
 

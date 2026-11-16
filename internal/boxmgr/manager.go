@@ -842,6 +842,7 @@ func (m *Manager) ensureMonitor(ctx context.Context) error {
 		if m.monitorServer != nil {
 			m.monitorServer.SetNodeManager(m)
 			m.monitorServer.SetRoutingStore(m.routingStore)
+			m.monitorServer.SetOutboundConverter(builder.SubscriptionOutbound)
 		}
 		// Note: StartPeriodicHealthCheck is called after nodes are registered in Start()
 	}

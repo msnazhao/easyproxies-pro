@@ -110,8 +110,9 @@ type Server struct {
 	// multiplying total in-flight dials and starving host fd/memory limits.
 	probeAllInFlight atomic.Bool
 
-	subRefresher SubscriptionRefresher
-	nodeMgr      NodeManager
+	subRefresher      SubscriptionRefresher
+	nodeMgr           NodeManager
+	outboundConverter func(string, string, bool) ([]byte, error)
 }
 
 // NewServer constructs a server; it can be nil when disabled.
@@ -153,6 +154,7 @@ func NewServer(cfg Config, mgr *Manager, logger *log.Logger) *Server {
 	mux.HandleFunc("/api/nodes/", s.withAuth(s.handleNodeAction))
 	mux.HandleFunc("/api/debug", s.withAuth(s.handleDebug))
 	mux.HandleFunc("/api/export", s.withAuth(s.handleExport))
+	mux.HandleFunc("/sub/proxies", s.handleProxySubscription)
 	mux.HandleFunc("/api/subscription/status", s.withAuth(s.handleSubscriptionStatus))
 	mux.HandleFunc("/api/subscription/refresh", s.withAuth(s.handleSubscriptionRefresh))
 	mux.HandleFunc("/api/subscription/config", s.withAuth(s.handleSubscriptionConfig))
@@ -166,6 +168,16 @@ func NewServer(cfg Config, mgr *Manager, logger *log.Logger) *Server {
 		BaseContext:    func(net.Listener) context.Context { return s.ctx },
 	}
 	return s
+}
+
+// SetOutboundConverter supplies the runtime's canonical URI-to-sing-box conversion.
+func (s *Server) SetOutboundConverter(fn func(string, string, bool) ([]byte, error)) {
+	if s == nil {
+		return
+	}
+	s.cfgMu.Lock()
+	s.outboundConverter = fn
+	s.cfgMu.Unlock()
 }
 
 // SetSubscriptionRefresher sets the subscription refresher for API endpoints.

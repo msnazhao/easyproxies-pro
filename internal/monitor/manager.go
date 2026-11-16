@@ -38,6 +38,11 @@ type NodeInfo struct {
 	Port          uint16 `json:"port,omitempty"`
 	Region        string `json:"region,omitempty"`  // GeoIP region code: "jp", "kr", "us", "hk", "tw", "other"
 	Country       string `json:"country,omitempty"` // Full country name from GeoIP
+	EntryCountry  string `json:"entry_country,omitempty"`
+	EntryISO      string `json:"entry_iso,omitempty"`
+	ExitIP        string `json:"exit_ip,omitempty"`
+	Provider      string `json:"provider,omitempty"`
+	CountryCode   string `json:"country_code,omitempty"`
 }
 
 // TimelineEvent represents a single usage event for debug tracking.
@@ -99,6 +104,7 @@ type entry struct {
 	probe            probeFunc
 	probeRun         *probeRun
 	probeGeneration  uint64
+	exitPending      bool
 	release          releaseFunc
 	blacklistFn      func(time.Duration)
 	initialCheckDone bool
@@ -111,7 +117,8 @@ type Manager struct {
 	cfg              Config
 	probeDst         M.Socksaddr
 	probeHost        string // probe target hostname (TLS SNI when probeTLS is true)
-	probeTLS         bool   // strict mode: probe via TLS with certificate verification
+	probeTLS         bool   // HTTPS health check, regardless of certificate policy
+	probeSkipVerify  bool   // explicitly configured certificate-verification override
 	probeReady       bool
 	probeConcurrency int
 	mu               sync.RWMutex
@@ -176,11 +183,9 @@ func clampProbeConcurrency(n int) int {
 	return n
 }
 
-// resolveProbeTarget derives the probe destination, TLS SNI host and strict-TLS
-// decision from a probe target string. Strict TLS is enabled only for an https
-// target when skip_cert_verify is off. It is pure so both NewManager and the
-// live SetProbeTarget reload path share identical parsing.
-func resolveProbeTarget(probeTarget string, skipCertVerify bool) (dst M.Socksaddr, host string, useTLS, ready bool) {
+// resolveProbeTarget derives the probe destination and TLS SNI host. HTTPS
+// always uses TLS even if certificate verification is explicitly disabled.
+func resolveProbeTarget(probeTarget string) (dst M.Socksaddr, host string, useTLS, ready bool) {
 	if probeTarget == "" {
 		return M.Socksaddr{}, "", false, false
 	}
@@ -206,7 +211,7 @@ func resolveProbeTarget(probeTarget string, skipCertVerify bool) (dst M.Socksadd
 			port = "80"
 		}
 	}
-	return M.ParseSocksaddrHostPort(h, parsePort(port)), h, isHTTPS && !skipCertVerify, true
+	return M.ParseSocksaddrHostPort(h, parsePort(port)), h, isHTTPS, true
 }
 
 // NewManager constructs a manager and pre-validates the probe target.
@@ -219,7 +224,8 @@ func NewManager(cfg Config) (*Manager, error) {
 		cancel:           cancel,
 		probeConcurrency: clampProbeConcurrency(cfg.ProbeConcurrency),
 	}
-	m.probeDst, m.probeHost, m.probeTLS, m.probeReady = resolveProbeTarget(cfg.ProbeTarget, cfg.SkipCertVerify)
+	m.probeDst, m.probeHost, m.probeTLS, m.probeReady = resolveProbeTarget(cfg.ProbeTarget)
+	m.probeSkipVerify = cfg.SkipCertVerify
 	return m, nil
 }
 
@@ -252,9 +258,10 @@ func (m *Manager) ProbeConcurrency() int {
 // a long-lived singleton, so without this the startup-time target/TLS mode
 // would persist until the process restarts.
 func (m *Manager) SetProbeTarget(probeTarget string, skipCertVerify bool) {
-	dst, host, useTLS, ready := resolveProbeTarget(probeTarget, skipCertVerify)
+	dst, host, useTLS, ready := resolveProbeTarget(probeTarget)
 	m.mu.Lock()
 	m.probeDst, m.probeHost, m.probeTLS, m.probeReady = dst, host, useTLS, ready
+	m.probeSkipVerify = skipCertVerify
 	m.mu.Unlock()
 }
 
@@ -498,15 +505,15 @@ func (m *Manager) ClearNodes() {
 }
 
 // DestinationForProbe exposes the configured destination for health checks.
-// host is the probe target's hostname (used as TLS SNI); useTLS is true when
-// the probe must perform a TLS handshake with strict certificate verification.
-func (m *Manager) DestinationForProbe() (dest M.Socksaddr, host string, useTLS bool, ok bool) {
+// host is the probe target's hostname (used as TLS SNI); useTLS and
+// skipCertVerify independently control the HTTPS handshake and certificate policy.
+func (m *Manager) DestinationForProbe() (dest M.Socksaddr, host string, useTLS, skipCertVerify, ok bool) {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 	if !m.probeReady {
-		return M.Socksaddr{}, "", false, false
+		return M.Socksaddr{}, "", false, false, false
 	}
-	return m.probeDst, m.probeHost, m.probeTLS, true
+	return m.probeDst, m.probeHost, m.probeTLS, m.probeSkipVerify, true
 }
 
 // Snapshot returns a sorted copy of current node states.
@@ -943,4 +950,90 @@ func (h *EntryHandle) LastLatency() time.Duration {
 		return 0
 	}
 	return h.ref.lastProbe
+}
+
+// SetExit updates location only after a validated exit lookup. An unsuccessful
+// lookup leaves the node unclassified so a later successful check may retry.
+func (h *EntryHandle) SetExit(ip, iso, country, region, provider string) {
+	if h == nil || h.ref == nil {
+		return
+	}
+	h.ref.mu.Lock()
+	defer h.ref.mu.Unlock()
+	if h.ref.info.ExitIP != "" {
+		return
+	}
+	h.ref.info.ExitIP = ip
+	h.ref.info.CountryCode = iso
+	h.ref.info.Country = country
+	h.ref.info.Region = region
+	h.ref.info.Provider = provider
+}
+
+// BeginExitLookup coalesces concurrent checks of the same node.
+func (h *EntryHandle) BeginExitLookup() bool {
+	if h == nil || h.ref == nil {
+		return false
+	}
+	h.ref.mu.Lock()
+	defer h.ref.mu.Unlock()
+	if h.ref.exitPending || h.ref.info.ExitIP != "" {
+		return false
+	}
+	h.ref.exitPending = true
+	return true
+}
+
+func (h *EntryHandle) EndExitLookup() {
+	if h == nil || h.ref == nil {
+		return
+	}
+	h.ref.mu.Lock()
+	h.ref.exitPending = false
+	h.ref.mu.Unlock()
+}
+
+func (h *EntryHandle) ExitKnown() bool {
+	if h == nil || h.ref == nil {
+		return false
+	}
+	h.ref.mu.RLock()
+	defer h.ref.mu.RUnlock()
+	return h.ref.info.ExitIP != ""
+}
+
+func (h *EntryHandle) ExitCountryCode() string {
+	if h == nil || h.ref == nil {
+		return ""
+	}
+	h.ref.mu.RLock()
+	defer h.ref.mu.RUnlock()
+	return h.ref.info.CountryCode
+}
+
+func (h *EntryHandle) ExitIP() string {
+	if h == nil || h.ref == nil {
+		return ""
+	}
+	h.ref.mu.RLock()
+	defer h.ref.mu.RUnlock()
+	return h.ref.info.ExitIP
+}
+
+func (h *EntryHandle) Region() string {
+	if h == nil || h.ref == nil {
+		return ""
+	}
+	h.ref.mu.RLock()
+	defer h.ref.mu.RUnlock()
+	return h.ref.info.Region
+}
+
+func (h *EntryHandle) Available() bool {
+	if h == nil || h.ref == nil {
+		return false
+	}
+	h.ref.mu.RLock()
+	defer h.ref.mu.RUnlock()
+	return h.ref.initialCheckDone && h.ref.available && !(h.ref.blacklist && (h.ref.until.IsZero() || time.Now().Before(h.ref.until)))
 }

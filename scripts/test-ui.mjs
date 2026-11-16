@@ -29,6 +29,16 @@ async function fixture() {
 const nodes=()=>Array.from({length:10000},(_,i)=>({tag:`node-${i}`,name:`Fixture ${i}`,uri:'http://fixture.invalid:1',region:'us',source:'inline',initial_check_done:true,available:true,last_latency_ms:500-i%500,success_count:2,failure_count:1,timeline:Array.from({length:60},()=>({success:true,latency_ms:5}))}));
 const rows=el=>(el.innerHTML.match(/<tr>/g)||[]).length;
 
+test('relay search matches exit code and route; exit IP has its own cell',async()=>{
+ const f=await fixture(); f.context.fixtureNodes=[{tag:'relay',entry_iso:'US',country_code:'TR',exit_ip:'8.8.8.8',provider:'ISP',initial_check_done:true,available:true}];
+ f.run('allNodesCache=fixtureNodes');
+ for(const query of ['TR','US->TR','US → TR','8.8.8.8']) {
+   f.element('nodeSearch').value=query; f.run('applyNodeFilters(true)');
+   assert.equal(rows(f.element('nodesTableBody')),1,query);
+ }
+ assert.match(f.element('nodesTableBody').innerHTML,/<td[^>]*>8\.8\.8\.8<\/td>/);
+});
+
 test('10k config and diagnostics render only 300 rows; timeline is bounded',async()=>{
  const f=await fixture(); f.context.fixtureNodes=nodes(); f.run('configNodes=fixtureNodes; window._debugNodes=fixtureNodes; renderConfigNodes(); renderDebugNodes();');
  assert.equal(rows(f.element('configNodesTableBody')),300); assert.equal(rows(f.element('debugNodesTableBody')),300); assert.equal((f.element('debugNodesTableBody').innerHTML.match(/tl-dot /g)||[]).length,9000);

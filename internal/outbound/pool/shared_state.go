@@ -24,8 +24,11 @@ type sharedMemberState struct {
 	banIsCooldown bool
 	// Operator bans outlive probes and the all-banned recovery path.
 	manualUntil time.Time
-	entry       atomic.Pointer[monitor.EntryHandle]
-	active      atomic.Int32
+	// A failed HTTPS health check is a security failure, not a recoverable
+	// transport fault. Keep its ban through successful probes and pool recovery.
+	httpsUntil time.Time
+	entry      atomic.Pointer[monitor.EntryHandle]
+	active     atomic.Int32
 }
 
 // failureKind classifies a dial failure so the caller can pick the right
@@ -211,7 +214,7 @@ func (s *sharedMemberState) recordFailure(cause error, policy failurePolicy) (in
 // traffic at all right now — a named session's pinned dial failing on a real
 // transport fault. An already-running longer ban is preserved, and the node
 // keeps its usual auto-clear/release paths.
-func (s *sharedMemberState) blacklistNow(cause error, policy failurePolicy) time.Time {
+func (s *sharedMemberState) blacklistNow(cause error, policy failurePolicy, httpsFailure bool) time.Time {
 	until := time.Now().Add(policy.BlacklistDuration)
 
 	s.mu.Lock()
@@ -222,6 +225,9 @@ func (s *sharedMemberState) blacklistNow(cause error, policy failurePolicy) time
 	s.blacklistedUntil = until
 	s.banIsCooldown = false
 	s.failures = 0
+	if httpsFailure && until.After(s.httpsUntil) {
+		s.httpsUntil = until
+	}
 	s.mu.Unlock()
 
 	if entry := s.entry.Load(); entry != nil {
@@ -252,6 +258,7 @@ func (s *sharedMemberState) isBlacklisted(now time.Time) bool {
 		s.blacklistedUntil = time.Time{}
 		s.banIsCooldown = false
 		s.manualUntil = time.Time{}
+		s.httpsUntil = time.Time{}
 	}
 	blacklisted := s.blacklisted
 	s.mu.Unlock()
@@ -291,6 +298,7 @@ func (s *sharedMemberState) forceRelease() {
 	s.blacklistedUntil = time.Time{}
 	s.banIsCooldown = false
 	s.manualUntil = time.Time{}
+	s.httpsUntil = time.Time{}
 	s.mu.Unlock()
 
 	if entry := s.entry.Load(); entry != nil {
@@ -305,7 +313,7 @@ func (s *sharedMemberState) forceRelease() {
 // Returns true when state was cleared.
 func (s *sharedMemberState) releaseIfPermanent(now time.Time) bool {
 	s.mu.Lock()
-	if now.Before(s.manualUntil) || (s.blacklisted && s.banIsCooldown && now.Before(s.blacklistedUntil)) {
+	if now.Before(s.manualUntil) || now.Before(s.httpsUntil) || (s.blacklisted && s.banIsCooldown && now.Before(s.blacklistedUntil)) {
 		s.mu.Unlock()
 		return false
 	}
@@ -314,6 +322,7 @@ func (s *sharedMemberState) releaseIfPermanent(now time.Time) bool {
 	s.blacklistedUntil = time.Time{}
 	s.banIsCooldown = false
 	s.manualUntil = time.Time{}
+	s.httpsUntil = time.Time{}
 	s.mu.Unlock()
 
 	if entry := s.entry.Load(); entry != nil {

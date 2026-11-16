@@ -2,6 +2,8 @@ package geoip
 
 import (
 	"bufio"
+	"context"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -40,6 +42,21 @@ func TestParseRequestRejectsInvalidRegionHeader(t *testing.T) {
 	}
 	if got := req.Header.Get(regionHeader); got != "" {
 		t.Fatalf("region header was not removed: %q", got)
+	}
+}
+
+func TestRegionWithoutPoolDoesNotFallBackToGlobal(t *testing.T) {
+	router := NewRouter(RouterConfig{}, nil)
+	defer router.Stop()
+	router.SetGlobalPool(&pointerDialer{dial: func(_ context.Context, _, _ string) (net.Conn, error) {
+		t.Fatal("region request escaped into global pool")
+		return nil, nil
+	}})
+	req := httptest.NewRequest(http.MethodGet, "http://example.test/us/path", nil)
+	w := httptest.NewRecorder()
+	router.ServeHTTP(w, req)
+	if w.Code != http.StatusServiceUnavailable {
+		t.Fatalf("status=%d, want 503", w.Code)
 	}
 }
 

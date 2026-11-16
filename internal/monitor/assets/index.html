@@ -681,7 +681,7 @@
         </div>
 
         <div class="filter-toolbar">
-          <label class="search-field"><span class="sr-only">搜索节点名称、标签或地域</span><svg fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><use href="#i-search"/></svg><input type="search" id="nodeSearch" class="setting-input" placeholder="搜索节点名称、标签或地域" oninput="applyNodeFilters(true)" /></label>
+          <label class="search-field"><span class="sr-only">搜索节点、出口或服务商</span><svg fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><use href="#i-search"/></svg><input type="search" id="nodeSearch" class="setting-input" placeholder="搜索节点、出口或服务商" oninput="applyNodeFilters(true)" /></label>
           <label><span class="sr-only">按节点状态筛选</span><select id="nodeStatusFilter" class="setting-input" onchange="applyNodeFilters(true)"><option value="all">所有状态</option><option value="healthy">健康在线</option><option value="pending">等待检查</option><option value="unavailable">不可用</option><option value="blacklisted">已拉黑</option></select></label>
           <label><span class="sr-only">节点排序</span><select id="nodeSort" class="setting-input" onchange="applyNodeFilters(true)"><option value="default">默认顺序</option><option value="latency">延迟优先</option><option value="connections">连接数优先</option><option value="failures">失败次数优先</option><option value="name">名称排序</option></select></label>
           <span class="filter-count" id="nodeFilterCount"></span>
@@ -695,7 +695,8 @@
               <thead>
                 <tr>
                   <th scope="col">状态</th>
-                  <th scope="col">地域</th>
+                  <th scope="col">出口 / 服务商</th>
+                  <th scope="col">出口 IP</th>
                   <th scope="col">名称 (Name/Tag)</th>
                   <th scope="col">端口</th>
                   <th scope="col">延迟 / 质量</th>
@@ -723,10 +724,12 @@
             <div class="panel-header"><div class="panel-title">接入链接生成器</div><span class="badge badge-offline">主入口</span></div>
             <form class="session-form" onsubmit="generateProxyLink(event)">
               <div class="form-grid">
-                <div class="form-group"><label for="proxyLinkMode">路由方式</label><select id="proxyLinkMode" class="setting-input" onchange="updateProxyLinkMode()"><option value="session">命名会话 · 固定出口</option><option value="normal">普通连接 · 按池调度</option></select></div>
+                <div class="form-group"><label for="proxyLinkMode">路由方式</label><select id="proxyLinkMode" class="setting-input" onchange="updateProxyLinkMode()"><option value="session">命名会话 · 固定出口</option><option value="fastest">最快可用 · 动态出口</option><option value="normal">普通连接 · 按池调度</option></select></div>
                 <div class="form-group"><label for="proxyLinkScheme">代理协议</label><select id="proxyLinkScheme" class="setting-input" onchange="clearGeneratedLink()"><option value="http">HTTP / CONNECT</option><option value="socks5">SOCKS5</option></select></div>
               </div>
               <div class="form-group" id="proxySessionIDField" style="margin-top:16px"><label for="proxySessionID">会话 ID</label><div class="session-id-row"><input type="text" id="proxySessionID" class="setting-input" maxlength="100" pattern="[A-Za-z0-9_-]{1,100}" required autocomplete="off" placeholder="例如 task_01" oninput="clearGeneratedLink()" /><button type="button" class="btn" onclick="randomizeSessionID()">随机生成</button></div><p class="form-help" id="sessionIDHelp">1–100 位英文字母、数字、下划线或连字符。完整用户名为 基础用户名.会话ID。</p></div>
+              <div class="form-group" id="proxyFastCountryField" hidden style="margin-top:16px"><label for="proxyFastCountry">出口国家</label><input type="text" id="proxyFastCountry" class="setting-input" maxlength="2" pattern="[A-Za-z]{2}" placeholder="不限国家" oninput="clearGeneratedLink()" /></div>
+              <p class="form-help" style="margin-top:10px">会话 ID 填 _fast1_ 时，每次连接选择最快健康节点；_fast1_us_ 限美国出口，_fast1_gb_ 限英国出口。完整用户名例如 基础用户名._fast1_us_，国家使用两位代码。</p>
               <button type="submit" class="btn btn-primary" id="generateLinkBtn" style="margin-top:18px"><svg fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><use href="#i-link"/></svg> 生成接入链接</button>
               <div class="notice error-banner" id="linkError" role="alert" hidden style="margin-top:16px;margin-bottom:0"></div>
               <div class="generated-link" id="generatedLink" hidden><span class="form-help">接入 URL · 密码已遮蔽</span><code id="maskedProxyURL"></code><div class="copy-actions"><button type="button" class="btn" onclick="copyProxyLink('url')">复制完整 URL</button><button type="button" class="btn" onclick="copyProxyLink('curl')">复制 curl 命令</button></div><p class="form-help" style="margin-top:10px">复制内容包含真实凭据，请妥善保管；不会保存到浏览器本地存储。</p></div>
@@ -858,7 +861,7 @@
                 </div>
                 <div class="form-group">
                   <label for="settingProbeTarget">探测目标 (Probe Target)</label>
-                  <input type="text" id="settingProbeTarget" class="setting-input" placeholder="www.apple.com:80" />
+                  <input type="text" id="settingProbeTarget" class="setting-input" placeholder="https://www.gstatic.com/generate_204" />
                 </div>
                 <div class="form-group" style="justify-content:flex-end;">
                   <label>&nbsp;</label>
@@ -1611,7 +1614,7 @@
     function applyNodeFilters(resetLimit=false) {
       if(resetLimit) nodeRenderLimit=300;
       const query=document.getElementById('nodeSearch').value.trim().toLowerCase(),status=document.getElementById('nodeStatusFilter').value;
-      const nodes=allNodesCache.filter(n => (currentRegionFilter === 'all' || (n.region||'other') === currentRegionFilter) && (status === 'all' || nodeStatus(n) === status) && (!query || [n.name,n.tag,n.region,n.country].some(v => String(v || '').toLowerCase().includes(query))));
+      const nodes=allNodesCache.filter(n => (currentRegionFilter === 'all' || (n.region||'other') === currentRegionFilter) && (status === 'all' || nodeStatus(n) === status) && (!query || [n.name,n.tag,n.region,n.country,n.country_code,n.provider,n.exit_ip,n.entry_country,n.entry_iso,`${n.entry_iso || ''}->${n.country_code || ''}`,`${n.entry_iso || ''} → ${n.country_code || ''}`].some(v => String(v || '').toLowerCase().includes(query))));
       const sort=document.getElementById('nodeSort').value;
       if (sort === 'latency') nodes.sort((a,b) => (nodeStatus(a)==='healthy' ? (a.last_latency_ms>=0 ? a.last_latency_ms : Infinity) : Infinity)-(nodeStatus(b)==='healthy' ? (b.last_latency_ms>=0 ? b.last_latency_ms : Infinity) : Infinity));
       else if (sort === 'connections') nodes.sort((a,b) => (b.active_connections||0)-(a.active_connections||0));
@@ -1639,7 +1642,8 @@
 
         return `<tr>
           <td><span class="badge ${badge}" title="${escapeHtml(n.last_error || statusText)}">${statusText}</span></td>
-          <td>${escapeHtml((n.region||'other').toUpperCase())}</td>
+          <td><div class="cell-trunc" title="${escapeHtml(n.exit_ip || '出口待检测')}">${escapeHtml(n.exit_ip ? ((n.entry_iso && n.country_code && n.entry_iso !== n.country_code ? n.entry_iso + ' → ' : '') + (n.country_code || n.country || '未知')) : '待检测')}</div><div class="cell-trunc" style="font-size:11px;color:var(--text-muted)" title="${escapeHtml(n.provider || '')}">${escapeHtml(n.provider || '-')}</div></td>
+          <td class="tt-mono" style="overflow-wrap:anywhere">${escapeHtml(n.exit_ip || '-')}</td>
           <td>
             <div class="cell-trunc" style="font-weight: 500" title="${escapeHtml(n.name || n.tag)}">${escapeHtml(n.name || n.tag)}</div>
             <div class="cell-trunc" style="font-size: 11px; color: var(--text-muted)" title="${escapeHtml(n.tag)}">${escapeHtml(n.tag)}</div>
@@ -1970,6 +1974,9 @@
       document.getElementById('proxySessionIDField').hidden = !named;
       document.getElementById('proxySessionID').required = named;
       document.getElementById('proxySessionID').disabled = !named;
+      const fastest = document.getElementById('proxyLinkMode').value === 'fastest';
+      document.getElementById('proxyFastCountryField').hidden = !fastest;
+      document.getElementById('proxyFastCountry').disabled = !fastest;
       clearGeneratedLink();
     }
     function randomizeSessionID() {
@@ -1983,7 +1990,8 @@
       clearGeneratedLink();
       const version = linkRequestVersion;
       const button = document.getElementById('generateLinkBtn');
-      const sessionID = document.getElementById('proxyLinkMode').value === 'session' ? document.getElementById('proxySessionID').value.trim() : '';
+      const country = document.getElementById('proxyFastCountry').value.trim().toLowerCase();
+      const sessionID = document.getElementById('proxyLinkMode').value === 'fastest' ? (country ? '_fast1_' + country + '_' : '_fast1_') : (document.getElementById('proxyLinkMode').value === 'session' ? document.getElementById('proxySessionID').value.trim() : '');
       if (document.getElementById('proxyLinkMode').value === 'session' && !/^[A-Za-z0-9_-]{1,100}$/.test(sessionID)) {
         const error = document.getElementById('linkError');
         error.textContent = '会话 ID 需为 1–100 位英文字母、数字、下划线或连字符。'; error.hidden = false;
@@ -2039,7 +2047,8 @@
         badge.className = 'badge ' + (result.enabled ? 'badge-healthy' : 'badge-warning');
         document.getElementById('sessionAvailability').textContent = result.enabled ? '主端口命名会话已就绪。使用 基础用户名.会话ID 接入；普通用户名保持原调度策略。' : (result.reason || '命名会话未启用，请检查运行模式与主入口认证配置。');
         document.getElementById('proxyLinkMode').querySelector('option[value="session"]').disabled = !result.enabled;
-        if (!result.enabled && document.getElementById('proxyLinkMode').value === 'session') {
+        document.getElementById('proxyLinkMode').querySelector('option[value="fastest"]').disabled = !result.enabled;
+        if (!result.enabled && ['session','fastest'].includes(document.getElementById('proxyLinkMode').value)) {
           document.getElementById('proxyLinkMode').value = 'normal'; updateProxyLinkMode();
         }
         document.getElementById('clearSessionsBtn').disabled = proxySessions.length === 0;

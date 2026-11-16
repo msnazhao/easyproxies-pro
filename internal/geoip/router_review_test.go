@@ -206,6 +206,7 @@ func TestHTTPForwardsHostBodyAndTrailersWithoutHopHeaders(t *testing.T) {
 	defer router.Stop()
 	dialer := &pointerDialer{dial: (&net.Dialer{}).DialContext}
 	router.SetGlobalPool(dialer)
+	router.SetPool(RegionUS, dialer)
 	for _, chunked := range []bool{false, true} {
 		req := httptest.NewRequest(http.MethodPost, upstream.URL+"/us/path", strings.NewReader("body"))
 		req.Host = "custom.virtual.test"

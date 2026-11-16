@@ -5,10 +5,12 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"strings"
 	"sync"
 	"testing"
 	"time"
 
+	"easy_proxies/internal/monitor"
 	"easy_proxies/internal/routing"
 
 	"github.com/sagernet/sing-box/adapter"
@@ -151,6 +153,68 @@ func sessionTestDialTag(ctx context.Context, p *poolOutbound) (string, error) {
 		return "", err
 	}
 	return tag, nil
+}
+
+func TestFastestSessionCountryFilter(t *testing.T) {
+	p := newSessionTestPool(nil, newSessionTestOutbound("us"), newSessionTestOutbound("gb"))
+	for i, member := range p.members {
+		mgr, _ := monitor.NewManager(monitor.Config{})
+		defer mgr.Stop()
+		entry := mgr.Register(monitor.NodeInfo{Tag: member.tag})
+		entry.MarkInitialCheckDone(true)
+		entry.RecordSuccessWithLatency(time.Duration(i+1) * time.Millisecond)
+		entry.SetExit("8.8.8.8", strings.ToUpper(member.tag), member.tag, member.tag, "ISP")
+		member.entry = entry
+	}
+	mustSessionTestDial(t, sessionTestContext(p, "account._fast1_gb_"), p, "gb")
+	mustSessionTestDial(t, sessionTestContext(p, "account._fast1_us_"), p, "us")
+	if _, err := sessionTestDialTag(sessionTestContext(p, "account._fast1_tr_"), p); err == nil {
+		t.Fatal("country-filtered fastest route fell back to another country")
+	}
+	if got := p.sessionStore.List(); len(got) != 0 {
+		t.Fatal("country-filtered fastest route created a sticky binding")
+	}
+}
+
+func TestFastestSessionReevaluatesHealthAndLatency(t *testing.T) {
+	p := newSessionTestPool(nil, newSessionTestOutbound("a"), newSessionTestOutbound("b"))
+	for i, member := range p.members {
+		mgr, _ := monitor.NewManager(monitor.Config{})
+		h := mgr.Register(monitor.NodeInfo{Tag: member.tag})
+		h.MarkInitialCheckDone(true)
+		h.RecordSuccessWithLatency(time.Duration(i+1) * 100 * time.Millisecond)
+		member.entry = h
+		defer mgr.Stop()
+	}
+	ctx := sessionTestContext(p, "account._fast1_")
+	mustSessionTestDial(t, ctx, p, "a")
+	p.members[1].entry.RecordSuccessWithLatency(10 * time.Millisecond)
+	mustSessionTestDial(t, ctx, p, "b")
+	p.members[1].entry.MarkAvailable(false)
+	mustSessionTestDial(t, ctx, p, "a")
+	if got := p.sessionStore.List(); len(got) != 0 {
+		t.Fatalf("fastest session must not pin a node: %+v", got)
+	}
+}
+
+func TestCountryPoolNeverFallsBackToServerCountry(t *testing.T) {
+	p := newSessionTestPool(nil, newSessionTestOutbound("server-us"), newSessionTestOutbound("exit-us"))
+	p.options.Region = "us"
+	mgr, _ := monitor.NewManager(monitor.Config{})
+	defer mgr.Stop()
+	for i, member := range p.members {
+		h := mgr.Register(monitor.NodeInfo{Tag: member.tag, EntryISO: "US", Region: "other"})
+		h.MarkInitialCheckDone(true)
+		if i == 1 {
+			h.SetExit("8.8.8.8", "US", "United States", "us", "ISP")
+		}
+		member.entry = h
+	}
+	mustSessionTestDial(t, context.Background(), p, "exit-us")
+	p.members[1].entry.MarkAvailable(false)
+	if _, err := sessionTestDialTag(context.Background(), p); err == nil {
+		t.Fatal("country pool routed through unmeasured server-country node")
+	}
 }
 
 func mustSessionTestDial(t *testing.T, ctx context.Context, p *poolOutbound, want string) {

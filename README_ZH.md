@@ -1,8 +1,8 @@
-# Easy Proxies
+# easyproxies-pro
 
 [English](README.md) | 简体中文
 
-Easy Proxies 是一个基于 sing-box 的代理池管理工具。
+`easyproxies-pro` 是基于 sing-box 的代理池管理工具，也是 [jasonwong1991/easy_proxies](https://github.com/jasonwong1991/easy_proxies) 的社区 fork，并在其基础上增加了路由、订阅导出和 Linux 二进制构建等改进。
 
 目标是把大量上游节点统一成稳定的本地 HTTP/SOCKS5 代理入口，同时支持按节点独立端口访问。
 
@@ -14,10 +14,14 @@ Easy Proxies 是一个基于 sing-box 的代理池管理工具。
   - `config.yaml` 的 `nodes`
   - `nodes_file`（每行一个 URI）
   - `subscriptions`（支持 Base64/纯文本/Clash YAML 解析）
-- 自动健康检查、失败熔断和黑名单恢复；暂时性故障（超时/连接重置/503）与限流故障（HTTP 429）分别使用可配置的独立冷却时间。
+- 默认严格 HTTPS 健康检查；检查失败的节点停止提供服务，可在面板管理黑名单。
 - 拨号失败自动重试：节点拨号失败时自动切换到另一个健康节点重试（可配置次数）。
 - 端口稳定（multi-port/hybrid）：每个节点按 URI 稳定标识（忽略名称与参数顺序），订阅刷新或重启后保持同一本地端口（持久化到 config.yaml 同目录的 `node_ports.json`）。
 - 主端口会话路由：使用 `用户名.sessionID` 在多次连接间固定上游节点，节点失效时切换；普通用户名沿用原池调度。旧版按来源 IP 绑定的独立粘性端口继续兼容（仅 pool/hybrid 模式）。
+- 最快可用会话：使用 `用户名._fast1_` 选择当前延时最低的健康节点，也可按出口国家筛选。
+- 出口信息与地区路由：展示实测出口 IP、国家和网络提供商；中转节点显示入口到出口国家，并支持按出口国家路由。
+- 节点订阅导出：通过 `/sub/proxies` 提供 V2Ray 兼容链接或 sing-box 配置，支持国家和协议筛选。
+- 均衡调度：在连接数相同时轮换不同出口及共用出口的节点。
 - Web 管理面板 + API：
   - 代理接入快捷卡片、节点搜索/状态筛选、探测/导出
   - **会话路由页**：生成会话 ID、复制 HTTP/SOCKS5 URL 或 curl、查看绑定与重置会话；预览隐藏密码，复制的完整地址含真实认证信息
@@ -109,7 +113,7 @@ pool:
 management:
   enabled: true
   listen: 0.0.0.0:9091
-  probe_target: http://cp.cloudflare.com/generate_204
+  probe_target: https://www.gstatic.com/generate_204
   password: ""
 
 dns:
@@ -122,7 +126,9 @@ nodes_file: nodes.txt
 
 ## GeoIP 地区路由
 
-启用 GeoIP 后，Easy Proxies 会按节点的地理位置自动分类，并提供独立
+`pool.mode: balance` 优先选择当前连接数最少的健康节点；负载相同时按实测出口 IP 分组轮换，同一出口组内再轮换节点，避免多个同出口节点连续占用调度。出口未知的节点独立参与调度。若可选节点共用出口，或上游实际出口发生变化，仍可能观察到相同公网 IP。
+
+启用 GeoIP 后，Easy Proxies 会按节点**实际出口 IP** 的地理位置自动分类，并提供独立
 HTTP 代理入口，以便通过指定地区的节点转发流量。
 
 ### 支持的地区
@@ -153,8 +159,21 @@ GeoIP 路由器复用 `listener.username` 和 `listener.password` 进行代理�
 
 - 首次启动时会自动下载 MaxMind GeoLite2-Country 数据库。
 - 默认每 24 小时检查更新，并热重载数据库，无需重启。
-- 启动和每次重载时都会自动重新分类节点。
-- 无法解析或查询 IP 归属地的节点会进入 `other` 分类。
+- 健康探测首次成功后通过节点查询出口 IP、国家和网络提供商；成功取得后周期探测不重复查询，订阅更新或核心重载后重新检测。
+- 健康检查默认使用 HTTPS 并严格校验证书；失败的代理立即拉黑，按 `pool.blacklist_duration` 到期或人工解封。只有主动开启 `skip_cert_verify` 才会跳过证书校验，探测仍通过 HTTPS 进行。
+- `other` 仅包含已确认出口属于其他国家的节点；出口信息未知的节点不会被国家路由选中。入口国家来自 GeoIP 数据库，跨国中转在监控列表显示为入口 → 出口。
+
+### 节点订阅
+
+`GET /sub/proxies?c=US` 返回已通过健康检查、出口 IP 已确认为美国的节点；省略 `c` 返回全部已通过检查的节点。默认 `f=v2ray` 返回 Base64 编码的兼容 URI 列表；`f=sing-box` 返回带 `urltest` 自动测速出口的 sing-box JSON 配置。V2Ray 列表仅包含兼容的 URI 协议；sing-box 配置使用程序运行时相同的节点协议转换。国家代码为两位 ISO 代码（如 `US`、`DE`），不限于路由器列出的七个地域。
+
+订阅地址无需认证，管理接口仍需登录。支持多国家和类型组合，例如 `/sub/proxies?c=US,GB&t=ss,vless&f=sing-box`。`t` 可选 `ss,vless,vmess,trojan,ssr,hysteria2,tuic`，省略表示不限制协议。
+
+### 最快会话
+
+在会话路由页面选择「最快可用」，或通过主代理入口使用 `listener.username._fast1_` 作为用户名。每次新建连接都会从已探测且健康、未冷却的节点中重新选择当前最低延迟节点；不会写入固定会话绑定，已建立的连接不会迁移。
+
+使用 `._fast1_us_` 限制美国出口，`._fast1_gb_` 限制英国出口，也支持其他两位国家代码；没有匹配的健康节点时请求失败，不跨国家回退。
 
 ### 使用方法
 
@@ -309,6 +328,7 @@ dns:
 - `POST /api/nodes/{tag}/blacklist`
 - `POST /api/nodes/probe-all`（SSE）
 - `GET /api/export`（默认导出健康节点，`all=true` 导出全部；`scheme=http/socks5/all`）
+- `GET /sub/proxies?c=US&f=sing-box`（按实测出口国家导出已检测的节点；`f=v2ray` 为默认值）
 - `GET|PUT /api/subscription/config`
 - `GET|POST /api/subscription/status|refresh`
 - `GET|POST|PUT|DELETE /api/nodes/config[...]`

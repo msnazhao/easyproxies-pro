@@ -8,6 +8,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"net/http/httptest"
 	"strings"
 	"testing"
 	"time"
@@ -136,6 +137,43 @@ func TestBalanceRotatesTiesWithoutSelectingBusierMembers(t *testing.T) {
 		}
 	}
 }
+
+func TestBalanceRotatesDistinctExitsAndNodesWithinExit(t *testing.T) {
+	p := newSessionTestPool(nil, newSessionTestOutbound("a1"), newSessionTestOutbound("a2"), newSessionTestOutbound("a3"), newSessionTestOutbound("b"))
+	p.mode = modeBalance
+	mgr, _ := monitor.NewManager(monitor.Config{})
+	defer mgr.Stop()
+	for i, member := range p.members {
+		entry := mgr.Register(monitor.NodeInfo{Tag: member.tag})
+		ip := "8.8.8.8"
+		if i == 3 {
+			ip = "1.1.1.1"
+		}
+		entry.SetExit(ip, "US", "United States", "us", "ISP")
+		member.entry = entry
+	}
+	counts := map[string]int{}
+	previous := ""
+	for i := 0; i < 60; i++ {
+		member := p.selectByMode(p.members)
+		ip := member.entry.ExitIP()
+		if ip == previous {
+			t.Fatalf("consecutive requests reused exit %s via %s", ip, member.tag)
+		}
+		previous = ip
+		counts[member.tag]++
+	}
+	if counts["b"] != 30 || counts["a1"] != 10 || counts["a2"] != 10 || counts["a3"] != 10 {
+		t.Fatalf("exit/node distribution: %v", counts)
+	}
+	// Load still takes precedence over exit rotation.
+	p.members[3].shared.active.Store(2)
+	for i := 0; i < 10; i++ {
+		if p.selectByMode(p.members).tag == "b" {
+			t.Fatal("exit rotation selected a busier node")
+		}
+	}
+}
 func TestSessionIdentityIndexRespectsTriedHealthAndProtocol(t *testing.T) {
 	a, b := newSessionTestOutbound("a", N.NetworkTCP), newSessionTestOutbound("b", N.NetworkTCP, N.NetworkUDP)
 	p := newSessionTestPool(nil, a, b)
@@ -172,6 +210,99 @@ type localProbeOutbound struct {
 	conn net.Conn
 }
 
+type tlsProbeOutbound struct {
+	*sessionTestOutbound
+	address string
+}
+
+func (o *tlsProbeOutbound) DialContext(ctx context.Context, _ string, _ M.Socksaddr) (net.Conn, error) {
+	return (&net.Dialer{}).DialContext(ctx, "tcp", o.address)
+}
+
+func TestHTTPSProbeBlacklistAndExplicitCertificateOverride(t *testing.T) {
+	server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer server.Close()
+	for _, skipVerify := range []bool{false, true} {
+		t.Run(fmt.Sprint("skip=", skipVerify), func(t *testing.T) {
+			mgr, err := monitor.NewManager(monitor.Config{})
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer mgr.Stop()
+			entry := mgr.Register(monitor.NodeInfo{Tag: "fixture"})
+			entry.SetExit("8.8.8.8", "US", "United States", "us", "Fixture")
+			state := &sharedMemberState{}
+			state.attachEntry(entry)
+			p := newSessionTestPool(nil)
+			p.options.BlacklistDuration = time.Hour
+			member := &memberState{tag: "fixture", outbound: &tlsProbeOutbound{
+				sessionTestOutbound: newSessionTestOutbound("fixture"), address: server.Listener.Addr().String(),
+			}, entry: entry, shared: state}
+			p.members = []*memberState{member}
+			_, err = p.probeMember(context.Background(), member, M.ParseSocksaddr("localhost:443"), "localhost", true, skipVerify)
+			if !skipVerify {
+				if err == nil || !state.isBlacklisted(time.Now()) || !mgr.Snapshot()[0].Blacklisted {
+					t.Fatalf("strict TLS accepted self-signed certificate: err=%v snapshot=%+v", err, mgr.Snapshot()[0])
+				}
+				if state.releaseIfPermanent(time.Now()) || p.releaseIfAllBlacklistedLocked(time.Now()) {
+					t.Fatal("HTTPS failure ban was automatically released")
+				}
+				state.forceRelease()
+				if state.isBlacklisted(time.Now()) {
+					t.Fatal("explicit release did not clear HTTPS failure ban")
+				}
+			} else if err != nil || state.isBlacklisted(time.Now()) {
+				t.Fatalf("explicit skip still failed HTTPS handshake: %v", err)
+			}
+		})
+	}
+}
+
+func TestHTTPSProbeBadResponseBlacklistsImmediately(t *testing.T) {
+	server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusServiceUnavailable)
+	}))
+	defer server.Close()
+	state := &sharedMemberState{}
+	member := &memberState{tag: "bad-response", outbound: &tlsProbeOutbound{
+		sessionTestOutbound: newSessionTestOutbound("bad-response"), address: server.Listener.Addr().String(),
+	}, shared: state}
+	p := newSessionTestPool(nil)
+	p.options.BlacklistDuration = time.Hour
+	if _, err := p.probeMember(context.Background(), member, M.ParseSocksaddr("localhost:443"), "localhost", true, true); err == nil || !state.isBlacklisted(time.Now()) {
+		t.Fatalf("bad HTTPS response did not blacklist: %v", err)
+	}
+}
+
+func TestExpiredHTTPSBlacklistStillNeedsSuccessfulProbe(t *testing.T) {
+	mgr, _ := monitor.NewManager(monitor.Config{})
+	defer mgr.Stop()
+	entry := mgr.Register(monitor.NodeInfo{Tag: "fixture"})
+	entry.MarkInitialCheckDone(true)
+	p := newSessionTestPool(nil, newSessionTestOutbound("fixture"))
+	member := p.members[0]
+	member.entry = entry
+	member.shared.attachEntry(entry)
+	member.shared.blacklistNow(errors.New("TLS verification failed"), p.failurePolicy(), true)
+	entry.MarkAvailable(false)
+	member.shared.mu.Lock()
+	member.shared.blacklistedUntil = time.Now().Add(-time.Second)
+	member.shared.httpsUntil = member.shared.blacklistedUntil
+	member.shared.mu.Unlock()
+	if _, err := p.pickMemberFiltered(N.NetworkTCP, nil, ""); err == nil {
+		t.Fatal("ordinary pool selected a node without a successful HTTPS recheck")
+	}
+	if _, err := p.pickMemberForSession(N.NetworkTCP, nil, p.memberIdentity(member)); err == nil {
+		t.Fatal("named session selected a node without a successful HTTPS recheck")
+	}
+	entry.MarkAvailable(true)
+	if _, err := p.pickMemberFiltered(N.NetworkTCP, nil, ""); err != nil {
+		t.Fatalf("successful HTTPS recheck did not restore node: %v", err)
+	}
+}
+
 func (o *localProbeOutbound) DialContext(context.Context, string, M.Socksaddr) (net.Conn, error) {
 	return o.conn, nil
 }
@@ -189,7 +320,7 @@ func TestCancelledProbeDoesNotRecordNodeFailure(t *testing.T) {
 	p := newSessionTestPool(nil)
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
-	if _, err := p.probeMember(ctx, member, M.ParseSocksaddr("fixture.test:80"), "fixture.test", false); err == nil {
+	if _, err := p.probeMember(ctx, member, M.ParseSocksaddr("fixture.test:80"), "fixture.test", false, false); err == nil {
 		t.Fatal("cancelled probe succeeded")
 	}
 	if snapshot := mgr.Snapshot()[0]; snapshot.FailureCount != 0 || snapshot.SuccessCount != 0 || snapshot.LastError != "" {

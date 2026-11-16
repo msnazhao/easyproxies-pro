@@ -1,17 +1,20 @@
-# Easy Proxies
+# easyproxies-pro
 
 [简体中文](README_ZH.md)
 
 > A sing-box based proxy pool manager -- aggregate many upstream proxy nodes into one stable, health-checked, load-balanced local proxy endpoint.
 
+`easyproxies-pro` is a community fork of [jasonwong1991/easy_proxies](https://github.com/jasonwong1991/easy_proxies), with additional routing, subscription export, and Linux binary build improvements.
+
 ## Features
 
 - **Three runtime modes**: `pool` (single-port load balancing), `multi-port` (one port per node), and `hybrid` (both simultaneously)
 - **Wide protocol support**: VLESS, VMess, Trojan, Shadowsocks, Hysteria2, TUIC, AnyTLS, SOCKS5, HTTP/HTTPS
-- **Automatic health checking** with configurable failure thresholds, blacklist duration, and separate cooldowns for transient (timeout/reset/503) and rate-limit (429) failures, plus manual blacklist/release from the dashboard
+- **Strict HTTPS health checking** by default, with failed nodes removed from service and manual blacklist/release from the dashboard
 - **Automatic fail-over retry**: when a node's dial fails, the request is retried on another healthy node (configurable attempts)
-- **GeoIP region routing**: classify nodes by country and route traffic through a specific region via a dedicated HTTP proxy endpoint
-- **Session routing on the main port**: use `username.sessionID` to keep the same upstream node across connections, with failover when that node fails; the bare username keeps normal pool scheduling. The optional legacy source-IP sticky port remains available
+- **Exit-aware routing and monitoring**: show measured exit IP, country, provider, and entry-to-exit routes; filter nodes by exit country
+- **Subscription exports**: provide healthy nodes as V2Ray-compatible links or sing-box configuration, filtered by country and protocol
+- **Session routing on the main port**: use `username.sessionID` to keep the same upstream node across connections, or `username._fast1_` to select the fastest healthy node; the optional legacy source-IP sticky port remains available
 - **Multiple node sources**: inline config, `nodes.txt` file, or subscription URLs (Base64, plain text, Clash YAML)
 - **Subscription auto-refresh with hot-reload**: periodically fetches subscription updates and reloads without restart
 - **Stable per-node ports**: in `multi-port`/`hybrid` mode each node keeps the same local port across subscription refreshes and restarts (persisted to `node_ports.json`)
@@ -107,7 +110,7 @@ Recreating the container clears in-memory named sessions, but saved per-node por
 |-----------|-------------|
 | `sequential` | Round-robin through healthy nodes |
 | `random` | Random node selection |
-| `balance` | Least-connections balancing |
+| `balance` | Least-connections balancing with exit-aware rotation |
 | `latency` | Pick the node with the lowest measured latency |
 
 ### Minimal Config Example
@@ -134,7 +137,7 @@ pool:
 management:
   enabled: true
   listen: 0.0.0.0:9091
-  probe_target: http://cp.cloudflare.com/generate_204
+  probe_target: https://www.gstatic.com/generate_204
   password: ""
 
 dns:
@@ -200,7 +203,15 @@ See [config.example.yaml](config.example.yaml) for the full documented configura
 
 ### Overview
 
-When GeoIP is enabled, Easy Proxies automatically classifies your proxy nodes by geographic region and provides a separate HTTP proxy endpoint that lets you route traffic through nodes in a specific country/region.
+When GeoIP is enabled, Easy Proxies classifies nodes by their measured **exit IP** and provides a separate HTTP proxy endpoint for country routing. On the first successful health check after startup or reload, each node independently looks up its exit IP, country and network provider through that node. Successful exit lookups are not repeated by periodic health checks. Unknown exits do not qualify for country routing; the UI shows entry → exit when the GeoIP database identifies a different entry country.
+
+`GET /sub/proxies?c=US,GB&t=ss,vless&f=sing-box` returns healthy nodes filtered by measured exit countries and proxy types. Omit `c` or `t` to include all countries or protocols. Supported types: `ss,vless,vmess,trojan,ssr,hysteria2,tuic`. The default `f=v2ray` returns Base64-encoded compatible proxy URIs; `f=sing-box` returns a sing-box JSON configuration with a `urltest` outbound. This subscription endpoint requires no authentication; management endpoints still require login.
+
+Health checks use HTTPS by default and immediately blacklist nodes that fail the check for the configured blacklist duration. Certificate verification is strict unless `skip_cert_verify` is explicitly enabled; even then, the health check still uses HTTPS/TLS.
+
+The reserved session username suffix `._fast1_` (for example `wang._fast1_`) selects the lowest measured latency among currently healthy nodes on every new connection, without creating a sticky binding. Existing connections are not migrated.
+
+Use `._fast1_us_` or `._fast1_gb_` to restrict selection to a measured US or GB exit. If no healthy matching exit exists, the request fails without falling back to another country.
 
 ### Supported Regions
 
@@ -365,6 +376,7 @@ Changing the management password takes effect immediately and invalidates existi
 | `/api/nodes/{tag}/release` | POST | Release node from blacklist |
 | `/api/nodes/probe-all` | POST | Probe all nodes (SSE stream) |
 | `/api/export` | GET | Export local proxy URLs; healthy nodes by default, `all=true` for all nodes, `scheme=http/socks5/all` |
+| `/sub/proxies` | GET | Tested nodes by exit country (`c=US`); `f=v2ray` (default) or `f=sing-box` |
 | `/api/subscription/config` | GET, PUT | Manage subscription URLs |
 | `/api/subscription/status` | GET | Check subscription status |
 | `/api/subscription/refresh` | POST | Trigger manual refresh |

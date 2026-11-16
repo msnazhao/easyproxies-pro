@@ -205,8 +205,7 @@ func (r *Router) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 	var dialer PoolDialer
 	if region != "" {
 		dialer = r.pools[region]
-	}
-	if dialer == nil {
+	} else {
 		dialer = r.global
 	}
 	r.mu.RUnlock()

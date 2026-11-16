@@ -50,6 +50,7 @@ listener:
 # ───────────────────────────────────────────────────────────────
 pool:
   # 调度模式: sequential（顺序）, random（随机）, balance（均衡）, latency（最低延迟）
+  # balance 优先最少连接；负载相同时轮换已测出口 IP，同出口内再轮换节点。
   mode: sequential
   # 连续失败多少次后加入黑名单
   failure_threshold: 3
@@ -84,6 +85,7 @@ pool:
 # 例如 listener.username 为 wang、password 为 "1234" 时：
 #   http://wang.account01:1234@127.0.0.1:2323  固定会话
 #   http://wang:1234@127.0.0.1:2323            普通调度
+#   http://wang._fast1_:1234@127.0.0.1:2323  每次新连接选择最低延迟健康节点（不固定）
 # 固定上游节点不等于保证公网出口 IP 永久不变。节点失效时按池重试策略切换，
 # 已建立连接不迁移，已发送请求不因 HTTP 业务错误自动重放。
 # 固定绑定针对 TCP；UDP 请求需要回退时不改 TCP 绑定，不保证 UDP 固定出口。
@@ -112,7 +114,7 @@ multi_port:
 management:
   enabled: true                                      # 是否启用管理面板
   listen: 0.0.0.0:9091                               # 监听地址
-  probe_target: http://cp.cloudflare.com/generate_204  # 健康检查目标
+  probe_target: https://www.gstatic.com/generate_204  # 默认校验证书；HTTPS 检查失败立即拉黑
   password: ""                                       # WebUI 访问密码，为空则不需要密码
 
 # ───────────────────────────────────────────────────────────────
@@ -129,7 +131,7 @@ dns:
 # ───────────────────────────────────────────────────────────────
 # GeoIP 地域分区配置（可选）
 # ───────────────────────────────────────────────────────────────
-# 启用后会为节点打上地域标签（jp/kr/us/hk/tw/other），用于 WebUI 统计和筛选。
+# 启用后以实测出口 IP 为节点打上地域标签；入口国家仅用于中转提示。
 geoip:
   enabled: true                      # 是否启用 GeoIP 地域标记
   database_path: "./GeoLite2-Country.mmdb"           # GeoIP 数据库路径（首次启动时自动下载）

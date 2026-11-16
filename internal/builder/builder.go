@@ -1,6 +1,7 @@
 package builder
 
 import (
+	"context"
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/json"
@@ -24,8 +25,19 @@ import (
 	C "github.com/sagernet/sing-box/constant"
 	"github.com/sagernet/sing-box/option"
 	"github.com/sagernet/sing/common/auth"
+	singjson "github.com/sagernet/sing/common/json"
 	"github.com/sagernet/sing/common/json/badoption"
 )
+
+// SubscriptionOutbound serializes the same protocol options used by the
+// running node, including transport and TLS settings.
+func SubscriptionOutbound(tag, uri string, skipCertVerify bool) ([]byte, error) {
+	outbound, err := buildNodeOutbound(tag, uri, skipCertVerify)
+	if err != nil {
+		return nil, err
+	}
+	return singjson.MarshalContext(context.Background(), &outbound)
+}
 
 // Build converts high level config into sing-box Options tree.
 func Build(cfg *config.Config) (option.Options, error) {
@@ -164,8 +176,9 @@ func Build(cfg *config.Config) (option.Options, error) {
 		// Collect results
 		for res := range results {
 			meta := metadata[res.tag]
-			meta.Region = res.region.Code
-			meta.Country = res.region.Country
+			meta.EntryCountry = res.region.Country
+			meta.EntryISO = res.region.ISOCode
+			meta.Region = geoip.RegionOther // Unclassified until an exit is observed.
 			metadata[res.tag] = meta
 			regionMembers[res.region.Code] = append(regionMembers[res.region.Code], res.tag)
 		}
@@ -189,9 +202,9 @@ func Build(cfg *config.Config) (option.Options, error) {
 	}
 	log.Printf("✅ Successfully built %d/%d nodes", len(baseOutbounds), len(cfg.Nodes))
 
-	// Log GeoIP region distribution
+	// Entry location is diagnostic only; routing uses the measured exit.
 	if cfg.GeoIP.Enabled {
-		log.Println("🌍 GeoIP Region Distribution:")
+		log.Println("🌍 Entry GeoIP Distribution (exit routing pending probe):")
 		for _, region := range geoip.AllRegions() {
 			count := len(regionMembers[region])
 			if count > 0 {
@@ -354,12 +367,10 @@ func Build(cfg *config.Config) (option.Options, error) {
 
 	// Build GeoIP region-based pool outbounds and routing
 	if cfg.GeoIP.Enabled && enablePoolInbound {
-		// Create pool outbound for each region that has nodes
+		// All region pools observe the same nodes; membership follows measured
+		// exit location at dial time instead of the server's GeoIP at build time.
 		for _, region := range geoip.AllRegions() {
-			members := regionMembers[region]
-			if len(members) == 0 {
-				continue
-			}
+			members := memberTags
 
 			// Build metadata for this region's members
 			regionMeta := make(map[string]poolout.MemberMeta)
@@ -369,6 +380,7 @@ func Build(cfg *config.Config) (option.Options, error) {
 
 			regionPoolTag := fmt.Sprintf("pool-%s", region)
 			regionPoolOptions := poolout.Options{
+				Region:             region,
 				Mode:               cfg.Pool.Mode,
 				Members:            members,
 				FailureThreshold:   cfg.Pool.FailureThreshold,

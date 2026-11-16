@@ -679,6 +679,9 @@ func isoCodeToRegion(isoCode string) string {
 	}
 }
 
+// RegionForISO returns the configured routing bucket for a measured exit ISO code.
+func RegionForISO(code string) string { return isoCodeToRegion(code) }
+
 // AllRegions returns all supported region codes
 func AllRegions() []string {
 	return []string{RegionJP, RegionKR, RegionUS, RegionHK, RegionTW, RegionSG, RegionOther}

@@ -426,7 +426,7 @@ func (c *Config) normalize() error {
 		c.Management.Listen = "127.0.0.1:9091"
 	}
 	if c.Management.ProbeTarget == "" {
-		c.Management.ProbeTarget = "www.apple.com:80"
+		c.Management.ProbeTarget = "https://www.gstatic.com/generate_204"
 	}
 	if c.Management.Enabled == nil {
 		defaultEnabled := true
@@ -804,7 +804,7 @@ func (c *Config) NormalizeWithPortMap(portMap map[string]uint16) error {
 		c.Management.Listen = "127.0.0.1:9091"
 	}
 	if c.Management.ProbeTarget == "" {
-		c.Management.ProbeTarget = "www.apple.com:80"
+		c.Management.ProbeTarget = "https://www.gstatic.com/generate_204"
 	}
 	if c.Management.Enabled == nil {
 		defaultEnabled := true
