@@ -36,7 +36,7 @@ type NodeInfo struct {
 	Mode          string `json:"mode"`
 	ListenAddress string `json:"listen_address,omitempty"`
 	Port          uint16 `json:"port,omitempty"`
-	Region        string `json:"region,omitempty"`  // GeoIP region code: "jp", "kr", "us", "hk", "tw", "other"
+	Region        string `json:"region,omitempty"`  // Region code derived from the measured exit IP.
 	Country       string `json:"country,omitempty"` // Full country name from GeoIP
 	EntryCountry  string `json:"entry_country,omitempty"`
 	EntryISO      string `json:"entry_iso,omitempty"`

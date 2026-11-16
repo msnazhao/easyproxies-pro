@@ -223,6 +223,10 @@ Use `._fast1_us_` or `._fast1_gb_` to restrict selection to a measured US or GB 
 | `hk` | Hong Kong 🇭🇰 |
 | `tw` | Taiwan 🇹🇼 |
 | `sg` | Singapore 🇸🇬 |
+| `gb` | United Kingdom 🇬🇧 |
+| `de` | Germany 🇩🇪 |
+| `fr` | France 🇫🇷 |
+| `tr` | Turkey 🇹🇷 |
 | `other` | All other regions |
 
 ### Configuration
@@ -281,8 +285,8 @@ Use a proxy-specific header facility instead.
 
 ### How It Works
 
-1. On startup, each node's server IP is resolved and looked up in the MaxMind GeoLite2-Country database
-2. Nodes are grouped into per-region pools (`pool-jp`, `pool-kr`, `pool-us`, etc.) with independent health checking
+1. On the first successful health check, each node's public exit IP is measured through that node and looked up in the MaxMind GeoLite2-Country database; the server IP is kept as entry-location diagnostics only
+2. Region filters and per-region pools (`pool-jp`, `pool-kr`, `pool-us`, etc.) use the measured exit country; an unmeasured exit is not assigned to a country
 3. The GeoIP router listens on its own port and selects a region from a proxy request header
 4. Matching requests are routed through the corresponding region pool; unmatched requests use the global pool
 5. Each region pool uses the same scheduling algorithm configured in the `pool` section
