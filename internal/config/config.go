@@ -1336,6 +1336,9 @@ func redactSubscriptionError(op, rawURL string, err error) error {
 
 // parseSubscriptionContent tries to parse subscription content in various formats (optimized)
 func parseSubscriptionContent(content string) ([]NodeConfig, error) {
+	if len(content) > maxSubscriptionBodySize {
+		return nil, fmt.Errorf("subscription content exceeds %d bytes", maxSubscriptionBodySize)
+	}
 	content = strings.TrimSpace(content)
 
 	// Detect Clash YAML by a line-anchored top-level "proxies:" key anywhere in
@@ -1519,13 +1522,17 @@ type clashRealityOptions struct {
 // Per-proxy decoding: a single malformed entry won't fail the whole subscription;
 // failed proxies are logged and skipped (fixes #23).
 func parseClashYAML(content string) ([]NodeConfig, error) {
+	if len(content) > maxSubscriptionBodySize {
+		return nil, fmt.Errorf("clash subscription exceeds %d bytes", maxSubscriptionBodySize)
+	}
 	content, marker, controls, err := maskClashControls(content)
 	if err != nil {
 		return nil, fmt.Errorf("parse clash yaml: %w", err)
 	}
 	var clash clashConfig
 	if err := yaml.Unmarshal([]byte(content), &clash); err != nil {
-		return nil, fmt.Errorf("parse clash yaml: %w", err)
+		// YAML errors can contain attacker-controlled scalar/anchor values.
+		return nil, errors.New("parse clash yaml: document rejected (invalid syntax, structure, or alias limits)")
 	}
 	if controls > 0 {
 		log.Printf("[subscription] WARN: isolated %d invalid YAML control characters; affected connection entries will be skipped", controls)
@@ -1533,24 +1540,34 @@ func parseClashYAML(content string) ([]NodeConfig, error) {
 
 	var nodes []NodeConfig
 	skipped := 0
+	outputBytes := 0
+	warnSkip := func(index int, reason string) {
+		skipped++
+		if skipped <= 10 {
+			log.Printf("[subscription] WARN: skip proxy #%d (%s)", index, reason)
+		} else if skipped == 11 {
+			log.Printf("[subscription] WARN: further per-node parse warnings suppressed")
+		}
+	}
 	for i, raw := range clash.Proxies {
 		cleanClashDisplayName(&raw, marker)
 		if damagedClashValue(&raw, marker, make(map[*yaml.Node]bool)) {
-			skipped++
-			log.Printf("[subscription] WARN: skip proxy #%d (invalid control characters in connection data)", i)
+			warnSkip(i, "unsafe characters, tags, or alias expansion in connection data")
 			continue
 		}
 		var proxy clashProxy
 		if err := raw.Decode(&proxy); err != nil {
-			skipped++
-			log.Printf("[subscription] WARN: skip proxy #%d (decode error): %v", i, err)
+			warnSkip(i, "invalid field types or values")
 			continue
 		}
 		uri := convertClashProxyToURI(proxy)
 		if uri == "" {
-			skipped++
-			log.Printf("[subscription] WARN: skip proxy %q (unsupported type %q)", proxy.Name, proxy.Type)
+			warnSkip(i, "unsupported protocol or invalid connection fields")
 			continue
+		}
+		outputBytes += len(uri) + len(proxy.Name)
+		if outputBytes > maxSubscriptionBodySize {
+			return nil, errors.New("parse clash yaml: expanded subscription exceeds output size limit")
 		}
 		nodes = append(nodes, NodeConfig{
 			Name: proxy.Name,

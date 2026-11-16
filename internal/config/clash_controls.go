@@ -72,24 +72,68 @@ func forbiddenYAMLCharacter(r rune) bool {
 }
 
 func damagedClashValue(node *yaml.Node, marker rune, seen map[*yaml.Node]bool) bool {
-	if node == nil || seen[node] {
-		return false
+	return clashExpansionCost(node, marker, seen, make(map[*yaml.Node]clashCost)).unsafe()
+}
+
+const maxClashExpandedNodes = 4096
+const maxClashExpandedBytes = 256 << 10
+
+type clashCost struct{ nodes, bytes int }
+
+func (c clashCost) unsafe() bool {
+	return c.nodes > maxClashExpandedNodes || c.bytes > maxClashExpandedBytes
+}
+func unsafeClashCost() clashCost {
+	return clashCost{maxClashExpandedNodes + 1, maxClashExpandedBytes + 1}
+}
+
+// Memoized costs count alias expansion without actually expanding the graph.
+// Reject cycles and non-text tags before Decode can reinterpret scalar bytes.
+func clashExpansionCost(node *yaml.Node, marker rune, visiting map[*yaml.Node]bool, costs map[*yaml.Node]clashCost) clashCost {
+	if node == nil {
+		return clashCost{}
 	}
-	if len(seen) >= 4096 {
-		return true
+	if visiting[node] {
+		return unsafeClashCost()
 	}
-	seen[node] = true
+	if len(visiting) >= 128 {
+		return unsafeClashCost()
+	}
+	if cost, ok := costs[node]; ok {
+		return cost
+	}
+	switch node.Tag {
+	case "", "!!map", "!!seq", "!!str", "!!int", "!!float", "!!bool", "!!null", "!!timestamp", "!!merge":
+	default:
+		return unsafeClashCost()
+	}
 	for _, r := range node.Value {
-		if forbiddenYAMLCharacter(r) || marker != 0 && r == marker {
-			return true
+		if unicode.IsControl(r) || marker != 0 && r == marker {
+			return unsafeClashCost()
 		}
+	}
+	visiting[node] = true
+	defer delete(visiting, node)
+	total := clashCost{1, len(node.Value)}
+	if total.unsafe() {
+		return unsafeClashCost()
 	}
 	for _, child := range node.Content {
-		if damagedClashValue(child, marker, seen) {
-			return true
+		childCost := clashExpansionCost(child, marker, visiting, costs)
+		total.nodes += childCost.nodes
+		total.bytes += childCost.bytes
+		if total.unsafe() {
+			return unsafeClashCost()
 		}
 	}
-	return damagedClashValue(node.Alias, marker, seen)
+	aliasCost := clashExpansionCost(node.Alias, marker, visiting, costs)
+	total.nodes += aliasCost.nodes
+	total.bytes += aliasCost.bytes
+	if total.unsafe() {
+		return unsafeClashCost()
+	}
+	costs[node] = total
+	return total
 }
 
 // Only the display-name scalar may be cleaned. Corruption anywhere else,

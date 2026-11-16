@@ -36,6 +36,9 @@ jobs:
           go test -race -count=1 ./...
       - name: Docker feature-tag tests
         run: go test -count=1 -tags "$FEATURE_TAGS" ./...
+      - name: Subscription parser security fuzzing
+        timeout-minutes: 3
+        run: go test ./internal/config -run '^$' -fuzz '^FuzzClashSubscriptionRecovery$' -fuzztime=20s -parallel=2 -timeout=90s
       - name: Reachable vulnerability checks (default and production tags)
         env:
           GOOS: linux
