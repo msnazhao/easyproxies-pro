@@ -1519,14 +1519,27 @@ type clashRealityOptions struct {
 // Per-proxy decoding: a single malformed entry won't fail the whole subscription;
 // failed proxies are logged and skipped (fixes #23).
 func parseClashYAML(content string) ([]NodeConfig, error) {
+	content, marker, controls, err := maskClashControls(content)
+	if err != nil {
+		return nil, fmt.Errorf("parse clash yaml: %w", err)
+	}
 	var clash clashConfig
 	if err := yaml.Unmarshal([]byte(content), &clash); err != nil {
 		return nil, fmt.Errorf("parse clash yaml: %w", err)
+	}
+	if controls > 0 {
+		log.Printf("[subscription] WARN: isolated %d invalid YAML control characters; affected connection entries will be skipped", controls)
 	}
 
 	var nodes []NodeConfig
 	skipped := 0
 	for i, raw := range clash.Proxies {
+		cleanClashDisplayName(&raw, marker)
+		if damagedClashValue(&raw, marker, make(map[*yaml.Node]bool)) {
+			skipped++
+			log.Printf("[subscription] WARN: skip proxy #%d (invalid control characters in connection data)", i)
+			continue
+		}
 		var proxy clashProxy
 		if err := raw.Decode(&proxy); err != nil {
 			skipped++
