@@ -5,6 +5,22 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [26.11.17] - 2026-11-17
+
+### Added
+- Query exit metadata with IPinfo Lite as the primary source and ipwho.is as fallback; support multiple API keys with automatic failover.
+- Add conditional AbuseIPDB checks, network usage types, abuse scores, organization short names, and API key settings in the WebUI.
+- Add network-type subscription filters, including `n=isp` for fixed-line and mobile ISP nodes, and enriched node names in exported subscriptions.
+- Add GB, DE, FR and TR filters based on measured exit countries.
+- Run subscription parser security regressions and fuzzing in CI.
+
+### Fixed
+- Preserve measured exit metadata across repeated pool registration and isolate replacement nodes from old callbacks.
+- Prevent asynchronous metadata completion from overwriting newer node names, URIs or port assignments, and retain real-use events received during a pending lookup.
+- Parse valid Clash nodes when other entries contain forbidden control characters; skip damaged connection entries without rewriting credentials or SNI.
+- Bound YAML alias expansion, input and generated output sizes, reject unsafe tags, and prevent rejected subscription values from leaking into parser logs.
+- Upload versioned Linux amd64/arm64 binaries to GitHub Releases when a version tag is built, including manually dispatched tag builds.
+
 ## [26.11.16] - 2026-11-16
 
 ### Added
