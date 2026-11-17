@@ -24,7 +24,15 @@ func (m *Manager) EnrichExit(ctx context.Context, h *EntryHandle, used bool) {
 	info := h.ref.info
 	h.ref.mu.Unlock()
 	go func() {
-		defer func() { h.ref.mu.Lock(); h.ref.metadataPending = false; h.ref.mu.Unlock() }()
+		defer func() {
+			h.ref.mu.Lock()
+			h.ref.metadataPending = false
+			followUp := ctx.Err() == nil && h.ref.metadataUsed && !h.ref.metadataUsageDone
+			h.ref.mu.Unlock()
+			if followUp {
+				m.EnrichExit(ctx, h, true)
+			}
+		}()
 		if info.OriginalName == "" {
 			info.OriginalName = info.Name
 		}
@@ -48,18 +56,15 @@ func (m *Manager) EnrichExit(ctx context.Context, h *EntryHandle, used bool) {
 				info.NetworkType = abuse.NetworkType()
 			}
 		}
-		var score *int
-		if info.Abuse != nil {
-			score = info.Abuse.Score
-		}
-		info.OrgShort = ipmeta.ShortOrg(info.Provider, info.OrgDomain)
-		info.Name = ipmeta.DisplayName(info.OriginalName, info.CountryCode, info.ExitIP, info.Provider, info.OrgDomain, info.NetworkType, score)
 		h.ref.mu.Lock()
-		h.ref.info = info
-		if ctx.Err() == nil {
-			h.ref.metadataVersion = version
-			h.ref.metadataUsageDone = wasUsed
+		if ctx.Err() != nil {
+			h.ref.mu.Unlock()
+			return
 		}
+		copyExitMetadata(&h.ref.info, info)
+		formatNodeName(&h.ref.info)
+		h.ref.metadataVersion = version
+		h.ref.metadataUsageDone = wasUsed
 		h.ref.mu.Unlock()
 	}()
 }

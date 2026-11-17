@@ -42,7 +42,7 @@ type Abuse struct {
 }
 
 func (a Abuse) NetworkType() string {
-	switch strings.ToLower(a.Usage) {
+	switch strings.ToLower(strings.TrimSpace(a.Usage)) {
 	case "fixed line isp":
 		return "isp"
 	case "mobile isp":

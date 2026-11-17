@@ -3,6 +3,7 @@ package monitor
 import (
 	"context"
 	"encoding/base64"
+	"encoding/json"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -14,6 +15,7 @@ import (
 
 	"easy_proxies/internal/config"
 	"easy_proxies/internal/ipmeta"
+	"easy_proxies/internal/ssuri"
 )
 
 func waitMetadata(t *testing.T, h *EntryHandle) {
@@ -109,5 +111,102 @@ func TestMetadataKeysSettingsRoundTrip(t *testing.T) {
 	r = proxyAPIRequest(t, s, http.MethodPut, "/api/settings", `{"ip_metadata":{"ipinfo_keys":[],"abuseipdb_keys":[]}}`)
 	if r.Code != 200 || s.mgr.Metadata.HasInfo() || s.mgr.Metadata.HasAbuse() {
 		t.Fatal("clearing keys failed")
+	}
+}
+
+func TestISPSubscriptionScoreAndOtherExclusions(t *testing.T) {
+	for _, tc := range []struct {
+		name, usage, score                  string
+		unavailable, unchecked, blacklisted bool
+		want                                bool
+	}{
+		{name: "fixed-zero", usage: "Fixed Line ISP", score: "0", want: true},
+		{name: "fixed-58", usage: "Fixed Line ISP", score: "58", want: true},
+		{name: "fixed-100", usage: "Fixed Line ISP", score: "100", want: true},
+		{name: "fixed-no-score", usage: "Fixed Line ISP", score: "null", want: true},
+		{name: "mobile-58", usage: "Mobile ISP", score: "58", want: true},
+		{name: "hosting-zero", usage: "Data Center/Web Hosting/Transit", score: "0"},
+		{name: "hosting-58", usage: "Data Center/Web Hosting/Transit", score: "58"},
+		{name: "unknown-58", usage: "Commercial", score: "58"},
+		{name: "unavailable-58", usage: "Fixed Line ISP", score: "58", unavailable: true},
+		{name: "unchecked-58", usage: "Fixed Line ISP", score: "58", unchecked: true},
+		{name: "blacklisted-58", usage: "Fixed Line ISP", score: "58", blacklisted: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			s, _ := newProxySessionTestServer(t, proxySessionTestConfig())
+			api := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				fmt.Fprintf(w, `{"data":{"ipAddress":"1.1.1.1","usageType":%q,"abuseConfidenceScore":%s}}`, tc.usage, tc.score)
+			}))
+			defer api.Close()
+			s.mgr.Metadata.AbuseURL = api.URL
+			s.mgr.Metadata.Configure(ipmeta.Config{AbuseKeys: []string{"fixture-key"}})
+			h := s.mgr.Register(NodeInfo{Tag: tc.name, Name: "Original", URI: "vless://uuid@fixture.example:443#Original", ExitIP: "1.1.1.1", CountryCode: "GB", Provider: "Example Network"})
+			if !tc.unchecked {
+				h.MarkInitialCheckDone(!tc.unavailable)
+			}
+			if tc.blacklisted {
+				h.Blacklist(time.Now().Add(time.Hour))
+			}
+			s.mgr.EnrichExit(context.Background(), h, false)
+			waitMetadata(t, h)
+			s.SetOutboundConverter(func(tag, uri string, _ bool) ([]byte, error) {
+				return json.Marshal(map[string]string{"type": "vless", "tag": tag, "uri": uri})
+			})
+			for _, format := range []string{"v2ray", "sing-box"} {
+				r := proxyAPIRequest(t, s, http.MethodGet, "/sub/proxies?n=isp&c=GB&f="+format, "")
+				if !tc.want {
+					if r.Code != http.StatusServiceUnavailable {
+						t.Fatalf("%s excluded node exported: %d %s", format, r.Code, r.Body)
+					}
+					continue
+				}
+				if r.Code != http.StatusOK {
+					t.Fatalf("%s omitted %s-score ISP: %d %s", format, tc.score, r.Code, r.Body)
+				}
+				body := r.Body.String()
+				if format == "v2ray" {
+					decoded, err := base64.StdEncoding.DecodeString(body)
+					if err != nil {
+						t.Fatal(err)
+					}
+					body = string(decoded)
+				}
+				if !strings.Contains(body, "fixture.example") {
+					t.Fatalf("%s missing node: %s", format, body)
+				}
+			}
+		})
+	}
+}
+
+func TestISPSubscriptionReportedSSURI(t *testing.T) {
+	uri := os.Getenv("EASYPROXIES_TEST_SS_URI")
+	if uri == "" {
+		uri = "ss://" + base64.RawStdEncoding.EncodeToString([]byte("aes-256-cfb:test-password")) + "@211.178.105.134:6123#%F0%9F%87%B0%F0%9F%87%B7KR_79"
+	}
+	original, err := ssuri.Parse(uri)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, score := range []int{0, 58, 100} {
+		s, _ := newProxySessionTestServer(t, proxySessionTestConfig())
+		name := ipmeta.DisplayName(original.Fragment, "KR", original.Server, "Example ISP", "example.com", "isp", &score)
+		s.mgr.Register(NodeInfo{Tag: "reported", Name: name, URI: uri, ExitIP: original.Server, CountryCode: "KR", NetworkType: "isp", Abuse: &ipmeta.Abuse{Score: &score, Usage: "Fixed Line ISP"}}).MarkInitialCheckDone(true)
+		r := proxyAPIRequest(t, s, http.MethodGet, "/sub/proxies?n=isp&t=ss&c=KR", "")
+		if r.Code != 200 {
+			t.Fatalf("score %d: export status %d", score, r.Code)
+		}
+		decoded, err := base64.StdEncoding.DecodeString(r.Body.String())
+		if err != nil {
+			t.Fatal(err)
+		}
+		exported, err := ssuri.Parse(string(decoded))
+		if err != nil {
+			t.Fatal("exported SS URI is invalid")
+		}
+		if exported.Method != original.Method || exported.Password != original.Password || exported.Server != original.Server || exported.Port != original.Port || exported.Fragment != name {
+			t.Fatal("export changed SS connection settings or display name")
+		}
+		t.Logf("SS export and reparse passed: score=%d, ISP=true, credentials preserved", score)
 	}
 }

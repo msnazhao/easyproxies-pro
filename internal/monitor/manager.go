@@ -498,6 +498,16 @@ func (m *Manager) Register(info NodeInfo) *EntryHandle {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	e, ok := m.nodes[info.Tag]
+	if ok {
+		e.mu.RLock()
+		same := sameNodeIdentity(e.info, info)
+		e.mu.RUnlock()
+		// Old callbacks keep their old entry; never let them enrich a new
+		// connection merely because its display tag was reused.
+		if !same {
+			ok = false
+		}
+	}
 	if !ok {
 		e = &entry{
 			info:     info,
@@ -506,6 +516,16 @@ func (m *Manager) Register(info NodeInfo) *EntryHandle {
 		m.nodes[info.Tag] = e
 	} else {
 		e.mu.Lock()
+		if e.info.ExitIP != "" {
+			if info.OriginalName == "" {
+				info.OriginalName = info.Name
+				if info.Name == e.info.Name && e.info.OriginalName != "" {
+					info.OriginalName = e.info.OriginalName
+				}
+			}
+			copyExitMetadata(&info, e.info)
+			formatNodeName(&info)
+		}
 		e.info = info
 		e.mu.Unlock()
 	}
