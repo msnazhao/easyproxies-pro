@@ -5,6 +5,11 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+- Remove ipwho.is from exit discovery. Prefer IPinfo Lite and cross-check with IPify; without a usable IPinfo key, use IPify and cross-check with ipapi.co.
+
 ## [26.11.17] - 2026-11-17
 
 ### Added

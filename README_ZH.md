@@ -292,7 +292,7 @@ dns:
 
 ## 出口信息与风险查询
 
-系统设置新增 IPinfo 和 AbuseIPDB key 列表，每行一个，保存至 `config.yaml` 的 `ip_metadata.ipinfo_keys` 和 `ip_metadata.abuseipdb_keys`。配置文件包含凭据，请限制访问。IPinfo Lite 通过每个节点访问 `/lite/me`，国家、ASN 和组织以它为准；没有 key 或 key 均不可用时回退至 ipwho.is，再尝试 ipapi.co。两家查询各串行执行，复用 HTTP 连接，认证或配额失败自动切换 key 并冷却。
+系统设置新增 IPinfo 和 AbuseIPDB key 列表，每行一个，保存至 `config.yaml` 的 `ip_metadata.ipinfo_keys` 和 `ip_metadata.abuseipdb_keys`。配置文件包含凭据，请限制访问。出口探测优先经节点请求 IPinfo Lite 的 `/lite/me`，再用 IPify 复核；没有可用的 IPinfo key 时，先用 IPify，再用 `ipapi.co` 复核。两者返回的 IP 一致才记录出口；可用时国家、ASN 和组织以 IPinfo Lite 为准。IPinfo 和 AbuseIPDB 各自串行执行，认证或配额失败时切换 key 并冷却。
 
 AbuseIPDB 没有 key 时不请求。出口发现后，排除 Amazon、Microsoft、Oracle、Google、OVH、GTHost、Melbikomas、Alibaba、Tencent、Greenhost、DigitalOcean、M247、Datacamp、Contabo、ByteVirt、VMISS 及组织名包含 host/cloud 的节点，其他节点查询使用类型和最近 90 天的风险分数。被排除的节点在实际代理连接成功使用后才查询。每个稳定节点身份在进程生命周期内只进行一次逻辑查询，故障 key 可在该次查询中轮换；相同出口 IP 共享成功结果，订阅刷新和核心重载不会重复查询。取消中的查询可以重试，程序重启会清空内存缓存。
 

@@ -2,34 +2,84 @@ package pool
 
 import (
 	"context"
-	"net"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
+
+	"easy_proxies/internal/ipmeta"
 )
 
-func TestLookupExitUsesNodeDialAndRejectsInvalidResponse(t *testing.T) {
-	body := `{"ip":"8.8.8.8","country_code":"US","country_name":"United States","org":"Example ISP"}`
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		_, _ = w.Write([]byte(body))
-	}))
-	defer server.Close()
-	called := false
-	dial := func(ctx context.Context, address string) (net.Conn, error) {
-		called = true
-		return (&net.Dialer{}).DialContext(ctx, "tcp", address)
-	}
-	ip, code, country, provider, err := lookupExitFrom(context.Background(), dial, server.URL)
-	if err != nil || !called || ip != "8.8.8.8" || code != "US" || country != "United States" || provider != "Example ISP" {
-		t.Fatalf("lookup: ip=%s code=%s country=%s provider=%s dialed=%t err=%v", ip, code, country, provider, called, err)
-	}
-	body = `{"ip":"127.0.0.1","country_code":"US"}`
-	if _, _, _, _, err := lookupExitFrom(context.Background(), dial, server.URL); err == nil {
-		t.Fatal("accepted loopback address as a public exit")
-	}
-	body = `{"ip":"1.1.1.1","success":true,"country_code":"AU","country":"Australia","connection":{"isp":"Cloud Provider"}}`
-	ip, code, country, provider, err = lookupExitFrom(context.Background(), dial, server.URL)
-	if err != nil || ip != "1.1.1.1" || code != "AU" || country != "Australia" || provider != "Cloud Provider" {
-		t.Fatalf("fallback response: %s %s %s %s %v", ip, code, country, provider, err)
+func TestLookupExitRequiresAgreement(t *testing.T) {
+	const ipify = `{"ip":"8.8.8.8"}`
+	const ipapi = `{"ip":"8.8.8.8","country_code":"us","country_name":"United States","org":"Example ISP"}`
+	const ipinfo = `{"ip":"8.8.8.8","country_code":"US","country":"United States","as_name":"Example ISP","asn":"AS1234"}`
+	for _, tc := range []struct {
+		name, echo, fallback, keyed, wantASN, wantError, wantFirst string
+	}{
+		{name: "no-key", echo: ipify, fallback: ipapi, wantFirst: "/echo"},
+		{name: "valid-key", echo: ipify, keyed: ipinfo, wantASN: "AS1234", wantFirst: "/lite/me"},
+		{name: "unavailable-key", echo: ipify, fallback: ipapi, keyed: "unauthorized", wantFirst: "/lite/me"},
+		{name: "keyed-mismatch", echo: ipify, fallback: ipapi, keyed: strings.Replace(ipinfo, "8.8.8.8", "1.1.1.1", 1), wantError: "exit probes disagree"},
+		{name: "no-key-mismatch", echo: ipify, fallback: strings.Replace(ipapi, "8.8.8.8", "1.1.1.1", 1), wantError: "exit probes disagree"},
+		{name: "private-echo", echo: `{"ip":"10.1.2.3"}`, wantError: "invalid IPify exit address"},
+		{name: "unavailable-echo", fallback: ipapi, wantError: "IPify exit probe"},
+		{name: "unavailable-location", echo: ipify, wantError: "ipapi.co exit probe"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			requests := make(chan string, 1)
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				select {
+				case requests <- r.URL.Path:
+				default:
+				}
+				var body string
+				switch r.URL.Path {
+				case "/echo":
+					body = tc.echo
+				case "/location":
+					body = tc.fallback
+				case "/lite/me":
+					if r.Header.Get("Authorization") != "Bearer test-key" || tc.keyed == "unauthorized" {
+						w.WriteHeader(http.StatusUnauthorized)
+						return
+					}
+					body = tc.keyed
+				}
+				if body == "" {
+					w.WriteHeader(http.StatusServiceUnavailable)
+					return
+				}
+				_, _ = w.Write([]byte(body))
+			}))
+			defer server.Close()
+			var metadata *ipmeta.Service
+			if tc.keyed != "" {
+				metadata = ipmeta.New()
+				defer metadata.Close()
+				metadata.InfoURL = server.URL + "/lite/"
+				metadata.Configure(ipmeta.Config{IPinfoKeys: []string{"test-key"}})
+			}
+			location, err := lookupExitFrom(context.Background(), server.Client(), server.URL+"/echo", server.URL+"/location", metadata)
+			if tc.wantFirst != "" {
+				select {
+				case first := <-requests:
+					if first != tc.wantFirst {
+						t.Fatalf("first request = %q, want %q", first, tc.wantFirst)
+					}
+				default:
+					t.Fatal("no probe request received")
+				}
+			}
+			if tc.wantError != "" {
+				if err == nil || !strings.Contains(err.Error(), tc.wantError) || location.IP != "" {
+					t.Fatalf("lookup = %+v, %v; want unclassified exit with error %q", location, err, tc.wantError)
+				}
+				return
+			}
+			if err != nil || location.IP != "8.8.8.8" || location.ISO != "US" || location.Country != "United States" || location.Org != "Example ISP" || location.ASN != tc.wantASN {
+				t.Fatalf("lookup = %+v, %v", location, err)
+			}
+		})
 	}
 }

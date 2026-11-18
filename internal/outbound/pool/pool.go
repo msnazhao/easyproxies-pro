@@ -4,7 +4,6 @@ import (
 	"bufio"
 	"context"
 	"crypto/tls"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -12,7 +11,6 @@ import (
 	"math/rand"
 	"net"
 	"net/http"
-	"net/netip"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -1111,8 +1109,8 @@ func (p *poolOutbound) probeMember(ctx context.Context, member *memberState, des
 			case <-p.ctx.Done():
 				return
 			}
-			if ip, iso, country, provider, lookupErr := p.lookupExit(member); lookupErr == nil {
-				entry.SetExit(ip, iso, country, geoip.RegionForISO(iso), provider)
+			if location, lookupErr := p.lookupExit(member); lookupErr == nil {
+				entry.SetExit(location.IP, location.ISO, location.Country, geoip.RegionForISO(location.ISO), location.Org)
 				if p.monitor != nil {
 					p.monitor.EnrichExit(p.ctx, entry, false)
 				}
@@ -1132,72 +1130,6 @@ func (p *poolOutbound) probeMember(ctx context.Context, member *memberState, des
 		member.shared.releaseIfPermanent(time.Now())
 	}
 	return duration, nil
-}
-
-// lookupExit never uses the machine's direct HTTP transport: the request is
-// dialed through this exact outbound. A bounded response prevents a remote
-// service from consuming unbounded memory.
-func lookupExit(ctx context.Context, node adapter.Outbound) (ip, iso, country, provider string, err error) {
-	dial := func(ctx context.Context, address string) (net.Conn, error) {
-		return node.DialContext(ctx, N.NetworkTCP, M.ParseSocksaddr(address))
-	}
-	ip, iso, country, provider, err = lookupExitFrom(ctx, dial, "https://ipwho.is/")
-	if err == nil || ctx.Err() != nil {
-		return
-	}
-	return lookupExitFrom(ctx, dial, "https://ipapi.co/json/")
-}
-
-func lookupExitFrom(ctx context.Context, dial func(context.Context, string) (net.Conn, error), endpoint string) (ip, iso, country, provider string, err error) {
-	ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
-	defer cancel()
-	transport := &http.Transport{DialContext: func(ctx context.Context, _, address string) (net.Conn, error) {
-		return dial(ctx, address)
-	}, TLSClientConfig: &tls.Config{MinVersion: tls.VersionTLS12}, DisableKeepAlives: true}
-	defer transport.CloseIdleConnections()
-	client := &http.Client{Transport: transport, CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
-	if err != nil {
-		return "", "", "", "", err
-	}
-	resp, err := client.Do(req)
-	if err != nil {
-		return "", "", "", "", err
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		return "", "", "", "", fmt.Errorf("exit lookup HTTP %d", resp.StatusCode)
-	}
-	var result struct {
-		IP          string `json:"ip"`
-		CountryCode string `json:"country_code"`
-		CountryName string `json:"country_name"`
-		Country     string `json:"country"`
-		Org         string `json:"org"`
-		Error       bool   `json:"error"`
-		Success     *bool  `json:"success"`
-		Connection  struct {
-			ISP string `json:"isp"`
-			Org string `json:"org"`
-		} `json:"connection"`
-	}
-	if err := json.NewDecoder(io.LimitReader(resp.Body, 4096)).Decode(&result); err != nil {
-		return "", "", "", "", err
-	}
-	addr, parseErr := netip.ParseAddr(result.IP)
-	if result.Error || result.Success != nil && !*result.Success || parseErr != nil || !addr.IsGlobalUnicast() || len(result.CountryCode) != 2 {
-		return "", "", "", "", errors.New("invalid exit location response")
-	}
-	if result.CountryName == "" {
-		result.CountryName = result.Country
-	}
-	if result.Org == "" {
-		result.Org = result.Connection.ISP
-	}
-	if result.Org == "" {
-		result.Org = result.Connection.Org
-	}
-	return result.IP, strings.ToUpper(result.CountryCode), result.CountryName, result.Org, nil
 }
 
 func (p *poolOutbound) makeProbeFunc(member *memberState) func(ctx context.Context) (time.Duration, error) {

@@ -287,7 +287,7 @@ Use a proxy-specific header facility instead.
 
 ### How It Works
 
-1. On the first successful health check, each node's public exit IP is measured through that node using IPinfo Lite when configured, with ipwho.is as fallback; the server IP is kept as entry-location diagnostics only
+1. After a successful health check, the node's public exit is confirmed through that node using IPify and an independent location lookup; the server IP is kept as entry-location diagnostics only
 2. Region filters and per-region pools (`pool-jp`, `pool-kr`, `pool-us`, etc.) use the measured exit country; an unmeasured exit is not assigned to a country
 3. The GeoIP router listens on its own port and selects a region from a proxy request header
 4. Matching requests are routed through the corresponding region pool; unmatched requests use the global pool
@@ -304,7 +304,7 @@ ip_metadata:
   abuseipdb_keys: [YOUR_ABUSEIPDB_KEY]
 ```
 
-IPinfo Lite is authoritative for country, ASN and organization. Its `/lite/me` request travels through the node itself. Missing/unavailable IPinfo keys fall back to ipwho.is (then ipapi.co). Each provider has a separate single-request lane, HTTP keep-alive, key failover, and cooldown on authentication/quota failures. AbuseIPDB is disabled without keys. It checks non-hosting organizations after exit discovery; known hosting providers are checked only after real traffic successfully uses the node. Checks use 90 days of reports, share results for identical exit IPs, and are attempted once per stable node identity during the process lifetime, including subscription refreshes/core reloads. Cancellation permits a later attempt. Restarting the process clears this in-memory cache.
+Exit discovery first asks IPinfo Lite (`/lite/me`) through the node when an IPinfo key is configured, then checks the observed IP against IPify. Without a usable IPinfo key, it starts with IPify and verifies the result with `ipapi.co`. The node remains unclassified until the two providers agree. IPinfo Lite is authoritative for country, ASN and organization when available. Each metadata provider has a separate single-request lane, HTTP keep-alive, key failover, and cooldown on authentication/quota failures. AbuseIPDB is disabled without keys. It checks non-hosting organizations after exit discovery; known hosting providers are checked only after real traffic successfully uses the node. Checks use 90 days of reports, share results for identical exit IPs, and are attempted once per stable node identity during the process lifetime, including subscription refreshes/core reloads. Cancellation permits a later attempt. Restarting the process clears this in-memory cache.
 
 Node display/export names are `ISP|score|country-code|exit-IP|short-org|original-name`, omitting the ISP marker and score when unavailable. Zero is a valid score. Only AbuseIPDB `Fixed Line ISP`/`Mobile ISP` usage types qualify for the ISP marker. Its score is report confidence (0-100), not a probability of maliciousness; `isTor` is kept separately. This API supplies no definitive VPN/proxy flags, so these remain unknown. Country and organization are never overwritten by AbuseIPDB. Original names/URIs remain intact in configuration, and names are recomputed without accumulating prefixes.
 
