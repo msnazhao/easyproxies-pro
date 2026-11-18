@@ -179,6 +179,8 @@ GeoIP 路由器复用 `listener.username` 和 `listener.password` 进行代理�
 
 使用 `._fast1_us_` 限制美国出口，`._fast1_gb_` 限制英国出口，也支持其他两位国家代码；没有匹配的健康节点时请求失败，不跨国家回退。
 
+在会话路由页面选择「最快 ISP · AbuseIPDB 0 分」，或使用 `基础用户名._fast1_isp_`。每次新连接从 AbuseIPDB 已确认是固定线路或移动 ISP 且评分为 `0` 的健康节点中选择延迟最低的出口。请配置 `ip_metadata.abuseipdb_keys` 以获取评分。没有合格节点时，连接失败。
+
 ### 使用方法
 
 GeoIP 路由器是独立端口上的 HTTP 代理。使用代理专用请求头

@@ -10,6 +10,7 @@ import (
 	"testing"
 	"time"
 
+	"easy_proxies/internal/ipmeta"
 	"easy_proxies/internal/monitor"
 	"easy_proxies/internal/routing"
 
@@ -173,6 +174,59 @@ func TestFastestSessionCountryFilter(t *testing.T) {
 	}
 	if got := p.sessionStore.List(); len(got) != 0 {
 		t.Fatal("country-filtered fastest route created a sticky binding")
+	}
+}
+
+func TestFastestSessionZeroAbuseISP(t *testing.T) {
+	zero, positive := 0, 1
+	nodes := []struct {
+		tag, usage string
+		score      *int
+	}{
+		{"hosting", "Data Center/Web Hosting/Transit", &zero},
+		{"nonzero", "Fixed Line ISP", &positive},
+		{"unknown", "Fixed Line ISP", nil},
+		{"mobile", "Mobile ISP", &zero},
+		{"fixed", "Fixed Line ISP", &zero},
+	}
+	outbounds := make([]*sessionTestOutbound, 0, len(nodes))
+	for _, node := range nodes {
+		outbounds = append(outbounds, newSessionTestOutbound(node.tag))
+	}
+	p := newSessionTestPool(nil, outbounds...)
+	mgr, _ := monitor.NewManager(monitor.Config{})
+	defer mgr.Stop()
+	for i, node := range nodes {
+		abuse := ipmeta.Abuse{Usage: node.usage, Score: node.score}
+		entry := mgr.Register(monitor.NodeInfo{
+			Tag: node.tag, ExitIP: "8.8.8.8", NetworkType: abuse.NetworkType(), Abuse: &abuse,
+		})
+		entry.MarkInitialCheckDone(true)
+		entry.RecordSuccessWithLatency(time.Duration(i+1) * time.Millisecond)
+		p.members[i].entry = entry
+	}
+
+	ctx := sessionTestContext(p, "account._fast1_isp_")
+	mustSessionTestDial(t, ctx, p, "mobile")
+	packet, err := p.ListenPacket(ctx, M.ParseSocksaddr("example.test:53"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	tag := packet.LocalAddr().String()
+	packet.Close()
+	if tag != "mobile" {
+		t.Fatalf("UDP selected %q, want mobile", tag)
+	}
+
+	outbounds[3].setDialHook(func(context.Context) error { return errors.New("dial failed") })
+	mustSessionTestDial(t, ctx, p, "fixed")
+	p.members[3].entry.MarkAvailable(false)
+	p.members[4].entry.MarkAvailable(false)
+	if _, err := sessionTestDialTag(ctx, p); err == nil {
+		t.Fatal("ISP route fell back to an ineligible node")
+	}
+	if got := p.sessionStore.List(); len(got) != 0 {
+		t.Fatalf("ISP route created sticky bindings: %+v", got)
 	}
 }
 

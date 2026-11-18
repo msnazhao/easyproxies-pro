@@ -320,7 +320,9 @@ func (p *poolOutbound) initializeMembersLocked() error {
 }
 
 func (p *poolOutbound) DialContext(ctx context.Context, network string, destination M.Socksaddr) (net.Conn, error) {
-	lease, binding, err := p.acquireSession(ctx)
+	key := routing.SessionFromContext(ctx)
+	fastest := routing.ParseFastestRoute(key)
+	lease, binding, err := p.acquireSession(ctx, key, fastest)
 	if err != nil {
 		return nil, err
 	}
@@ -328,8 +330,6 @@ func (p *poolOutbound) DialContext(ctx context.Context, network string, destinat
 		defer lease.Release()
 	}
 	maxAttempts := p.maxAttempts()
-	fastCountry, fastest := routing.FastestCountry(routing.SessionFromContext(ctx))
-	fastest = fastest && p.options.SessionRouting
 	stickyKey := p.stickyKeyFromCtx(ctx)
 	if lease != nil {
 		stickyKey = ""
@@ -348,8 +348,8 @@ func (p *poolOutbound) DialContext(ctx context.Context, network string, destinat
 		var member *memberState
 		if lease != nil {
 			member, err = p.pickMemberForSession(network, tried, pinned)
-		} else if fastest {
-			member, err = p.pickFastest(network, tried, fastCountry)
+		} else if fastest.Enabled && p.options.SessionRouting {
+			member, err = p.pickFastest(network, tried, fastest)
 		} else {
 			member, err = p.pickMemberFiltered(network, tried, stickyKey)
 		}
@@ -415,7 +415,9 @@ func (p *poolOutbound) DialContext(ctx context.Context, network string, destinat
 }
 
 func (p *poolOutbound) ListenPacket(ctx context.Context, destination M.Socksaddr) (net.PacketConn, error) {
-	lease, binding, err := p.acquireSession(ctx)
+	key := routing.SessionFromContext(ctx)
+	fastest := routing.ParseFastestRoute(key)
+	lease, binding, err := p.acquireSession(ctx, key, fastest)
 	if err != nil {
 		return nil, err
 	}
@@ -423,8 +425,6 @@ func (p *poolOutbound) ListenPacket(ctx context.Context, destination M.Socksaddr
 		defer lease.Release()
 	}
 	maxAttempts := p.maxAttempts()
-	fastCountry, fastest := routing.FastestCountry(routing.SessionFromContext(ctx))
-	fastest = fastest && p.options.SessionRouting
 	stickyKey := p.stickyKeyFromCtx(ctx)
 	if lease != nil {
 		stickyKey = ""
@@ -445,8 +445,8 @@ func (p *poolOutbound) ListenPacket(ctx context.Context, destination M.Socksaddr
 			// UDP may use the TCP pin if supported, but capability filtering and
 			// packet retries must never migrate the primary TCP binding.
 			member, err = p.pickMemberForSession(N.NetworkUDP, tried, pinned)
-		} else if fastest {
-			member, err = p.pickFastest(N.NetworkUDP, tried, fastCountry)
+		} else if fastest.Enabled && p.options.SessionRouting {
+			member, err = p.pickFastest(N.NetworkUDP, tried, fastest)
 		} else {
 			member, err = p.pickMemberFiltered(N.NetworkUDP, tried, stickyKey)
 		}
@@ -501,15 +501,11 @@ func (p *poolOutbound) ListenPacket(ctx context.Context, destination M.Socksaddr
 	return nil, fmt.Errorf("listen-packet failed after %d attempts: %w", maxAttempts, lastErr)
 }
 
-func (p *poolOutbound) acquireSession(ctx context.Context) (*routing.Lease, routing.Binding, error) {
+func (p *poolOutbound) acquireSession(ctx context.Context, key string, fastest routing.FastestRoute) (*routing.Lease, routing.Binding, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, routing.Binding{}, err
 	}
-	key := routing.SessionFromContext(ctx)
-	if _, fastest := routing.FastestCountry(key); fastest && p.options.SessionRouting {
-		return nil, routing.Binding{}, nil
-	}
-	if !p.options.SessionRouting || key == "" {
+	if !p.options.SessionRouting || key == "" || fastest.Enabled {
 		return nil, routing.Binding{}, nil
 	}
 	p.mu.Lock()
@@ -572,21 +568,19 @@ func (p *poolOutbound) maxAttempts() int {
 // When `tried` is nil or every healthy member has been tried, falls back to picking
 // any healthy member (ensuring single-member pools retry the same node).
 func (p *poolOutbound) pickMemberFiltered(network string, tried map[string]bool, stickyKey string) (*memberState, error) {
-	return p.pickMemberFor(network, tried, stickyKey, "")
+	return p.pickMemberFor(network, tried, stickyKey, "", routing.FastestRoute{})
 }
 
 func (p *poolOutbound) pickMemberForSession(network string, tried map[string]bool, nodeID string) (*memberState, error) {
-	return p.pickMemberFor(network, tried, "", nodeID)
+	return p.pickMemberFor(network, tried, "", nodeID, routing.FastestRoute{})
 }
 
-func (p *poolOutbound) pickFastest(network string, tried map[string]bool, country string) (*memberState, error) {
-	return p.pickMemberFor(network, tried, "", "__fastest__"+country)
+func (p *poolOutbound) pickFastest(network string, tried map[string]bool, fastest routing.FastestRoute) (*memberState, error) {
+	return p.pickMemberFor(network, tried, "", "", fastest)
 }
 
-func (p *poolOutbound) pickMemberFor(network string, tried map[string]bool, stickyKey, nodeID string) (*memberState, error) {
+func (p *poolOutbound) pickMemberFor(network string, tried map[string]bool, stickyKey, nodeID string, fastest routing.FastestRoute) (*memberState, error) {
 	now := time.Now()
-	fastest := strings.HasPrefix(nodeID, "__fastest__")
-	fastCountry := strings.TrimPrefix(nodeID, "__fastest__")
 
 	p.mu.Lock()
 	if len(p.members) == 0 {
@@ -597,7 +591,7 @@ func (p *poolOutbound) pickMemberFor(network string, tried map[string]bool, stic
 	}
 	// Most named-session traffic already has a successful pin. Resolve it in
 	// O(1) rather than scanning and locking every node in a large pool.
-	if nodeID != "" && !fastest {
+	if nodeID != "" {
 		if p.membersByID == nil {
 			p.indexMembersLocked()
 		}
@@ -622,16 +616,27 @@ func (p *poolOutbound) pickMemberFor(network string, tried map[string]bool, stic
 		}
 		p.mu.Unlock()
 	}
-	if fastest {
+	if fastest.Enabled {
 		filtered := candidates[:0]
 		for _, member := range candidates {
-			if member.entry != nil && member.entry.Available() && member.entry.LastLatency() > 0 && (fastCountry == "" || member.entry.ExitKnown() && member.entry.ExitCountryCode() == fastCountry) {
-				filtered = append(filtered, member)
+			entry := member.entry
+			if entry == nil || !entry.Available() || entry.LastLatency() <= 0 {
+				continue
 			}
+			if fastest.Country != "" && (!entry.ExitKnown() || entry.ExitCountryCode() != fastest.Country) {
+				continue
+			}
+			if fastest.ZeroAbuseISP && !entry.HasZeroAbuseISP() {
+				continue
+			}
+			filtered = append(filtered, member)
 		}
 		candidates = filtered
 		if len(candidates) == 0 {
 			p.putCandidateBuffer(candidates)
+			if fastest.ZeroAbuseISP {
+				return nil, E.New("no measured healthy ISP proxy with AbuseIPDB score 0 available")
+			}
 			return nil, E.New("no measured healthy proxy available")
 		}
 	}
@@ -657,7 +662,7 @@ func (p *poolOutbound) pickMemberFor(network string, tried map[string]bool, stic
 	}
 
 	var member *memberState
-	if nodeID != "" && !fastest {
+	if nodeID != "" {
 		for _, candidate := range candidates {
 			if p.memberIdentity(candidate) == nodeID {
 				member = candidate
@@ -666,7 +671,7 @@ func (p *poolOutbound) pickMemberFor(network string, tried map[string]bool, stic
 		}
 	}
 	if member == nil {
-		if fastest {
+		if fastest.Enabled {
 			member = p.selectLowestLatency(candidates)
 		} else {
 			member = p.selectMember(candidates, stickyKey)

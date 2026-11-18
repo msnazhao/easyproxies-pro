@@ -1047,6 +1047,18 @@ func (h *EntryHandle) ExitCountryCode() string {
 	return h.ref.info.CountryCode
 }
 
+// HasZeroAbuseISP reports whether the measured exit is an ISP with a known zero AbuseIPDB score.
+func (h *EntryHandle) HasZeroAbuseISP() bool {
+	if h == nil || h.ref == nil {
+		return false
+	}
+	h.ref.mu.RLock()
+	defer h.ref.mu.RUnlock()
+	info := &h.ref.info
+	return info.ExitIP != "" && (info.NetworkType == "isp" || info.NetworkType == "mobile") &&
+		info.Abuse != nil && info.Abuse.Score != nil && *info.Abuse.Score == 0
+}
+
 func (h *EntryHandle) ExitIP() string {
 	if h == nil || h.ref == nil {
 		return ""
