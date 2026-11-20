@@ -38,12 +38,6 @@ func (s *Server) writeProxySubscription(w http.ResponseWriter, r *http.Request, 
 			http.Error(w, "exit IP sessions unavailable", http.StatusServiceUnavailable)
 			return
 		}
-		user, password, ok := r.BasicAuth()
-		if _, authorized := routing.VerifyProxyCredentials(cfg.Listener.Username, cfg.Listener.Password, user, password, false); !ok || !authorized {
-			w.Header().Set("WWW-Authenticate", `Basic realm="Proxy subscription"`)
-			http.Error(w, "proxy listener credentials required", http.StatusUnauthorized)
-			return
-		}
 		exitProxy = url.URL{
 			Scheme: "socks5",
 			Host:   net.JoinHostPort(proxyLinkHost(cfg.ExternalIP, r), strconv.Itoa(int(cfg.Listener.Port))),

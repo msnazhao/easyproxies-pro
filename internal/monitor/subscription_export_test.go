@@ -118,8 +118,9 @@ func TestProxySubscriptionRejectsUnsupportedExports(t *testing.T) {
 	}
 }
 
-func TestExitProxySubscriptionSOCKS5(t *testing.T) {
+func TestExitProxySubscriptionSOCKS5WithoutAuth(t *testing.T) {
 	cfg := proxySessionTestConfig()
+	cfg.Management.Password = "management-secret"
 	cfg.ExternalIP = "relay.example"
 	cfg.Listener.Password = "password:@#"
 	s, store := newProxySessionTestServer(t, cfg)
@@ -159,7 +160,6 @@ func TestExitProxySubscriptionSOCKS5(t *testing.T) {
 	}
 	path := "/sub/proxies2?c=us,gb&t=vless,ss,hysteria2&n=isp&f=socks5"
 	req := httptest.NewRequest(http.MethodGet, "http://dashboard.example:9091"+path, nil)
-	req.SetBasicAuth(cfg.Listener.Username, cfg.Listener.Password)
 	w := httptest.NewRecorder()
 	s.srv.Handler.ServeHTTP(w, req)
 	if w.Code != http.StatusOK || w.Header().Get("Cache-Control") != "no-store" {
@@ -186,7 +186,6 @@ func TestExitProxySubscriptionSOCKS5(t *testing.T) {
 
 	// Protocol filtering can match a node that has no IP for the generated session.
 	unknown := httptest.NewRequest(http.MethodGet, "/sub/proxies2?t=vmess", nil)
-	unknown.SetBasicAuth(cfg.Listener.Username, cfg.Listener.Password)
 	w = httptest.NewRecorder()
 	s.srv.Handler.ServeHTTP(w, unknown)
 	if w.Code != http.StatusServiceUnavailable {
@@ -224,7 +223,6 @@ func TestSubscriptionsRequireSuccessfulHealthProbe(t *testing.T) {
 	for _, path := range []string{"/sub/proxies", "/sub/proxies?f=sing-box", "/sub/proxies2"} {
 		t.Run(path, func(t *testing.T) {
 			req := httptest.NewRequest(http.MethodGet, path, nil)
-			req.SetBasicAuth(cfg.Listener.Username, cfg.Listener.Password)
 			w := httptest.NewRecorder()
 			s.srv.Handler.ServeHTTP(w, req)
 			if w.Code != http.StatusOK {
@@ -247,26 +245,5 @@ func TestSubscriptionsRequireSuccessfulHealthProbe(t *testing.T) {
 				}
 			}
 		})
-	}
-}
-
-func TestExitProxySubscriptionRequiresListenerCredentials(t *testing.T) {
-	cfg := proxySessionTestConfig()
-	s, _ := newProxySessionTestServer(t, cfg)
-	for _, credentials := range []struct{ user, password string }{
-		{},
-		{cfg.Listener.Username + "._ip_8.8.8.8", cfg.Listener.Password},
-		{"wrong", cfg.Listener.Password},
-		{cfg.Listener.Username, "wrong"},
-	} {
-		req := httptest.NewRequest(http.MethodGet, "/sub/proxies2", nil)
-		if credentials.user != "" {
-			req.SetBasicAuth(credentials.user, credentials.password)
-		}
-		w := httptest.NewRecorder()
-		s.srv.Handler.ServeHTTP(w, req)
-		if w.Code != http.StatusUnauthorized || w.Header().Get("WWW-Authenticate") == "" {
-			t.Fatalf("unauthorized request returned %d", w.Code)
-		}
 	}
 }

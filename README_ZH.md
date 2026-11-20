@@ -173,7 +173,7 @@ GeoIP 路由器复用 `listener.username` 和 `listener.password` 进行代理�
 
 订阅地址无需认证，管理接口仍需登录。支持多国家和类型组合，例如 `/sub/proxies?c=US,GB&t=ss,vless&f=sing-box`。`t` 可选 `ss,vless,vmess,trojan,ssr,hysteria2,tuic`，省略表示不限制协议。
 
-两个订阅端点都要求有成功的健康探测记录，且节点当前可用并未被封禁。`GET /sub/proxies2?c=US,GB&n=isp&t=ss,vless` 也要求最近 30 分钟内确认过健康状态和出口 IP，逐行返回指向主代理入口的 `socks5://` 链接。每个出口 IP 只保留筛选后实测延迟最低的节点及其原显示名，用户名由出口 IP 生成，例如 `wang._ip_8.8.8.8`。此端点需要用主代理入口的基础用户名和密码做 HTTP Basic 认证。
+两个订阅端点都要求有成功的健康探测记录，且节点当前可用并未被封禁。`GET /sub/proxies2?c=US,GB&n=isp&t=ss,vless` 也要求最近 30 分钟内确认过健康状态和出口 IP，逐行返回指向主代理入口的 `socks5://` 链接。每个出口 IP 只保留筛选后实测延迟最低的节点及其原显示名，用户名由出口 IP 生成，例如 `wang._ip_8.8.8.8`。此订阅地址免认证，返回的链接包含主代理入口凭据。
 
 ### 最快会话
 
