@@ -8,6 +8,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"testing"
+	"time"
 )
 
 func TestInfoFailoverSerialAndCache(t *testing.T) {
@@ -50,7 +51,7 @@ func TestInfoFailoverSerialAndCache(t *testing.T) {
 	}
 }
 
-func TestAbuseNoKeyOnceAndFailureRotation(t *testing.T) {
+func TestAbuseCacheByExitAndFailureRotation(t *testing.T) {
 	var bad, good atomic.Int32
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Query().Get("maxAgeInDays") != "90" {
@@ -67,19 +68,25 @@ func TestAbuseNoKeyOnceAndFailureRotation(t *testing.T) {
 	defer server.Close()
 	service := New()
 	service.AbuseURL = server.URL
-	_, _ = service.Check(context.Background(), "node", "1.1.1.1")
+	_, _ = service.Check(context.Background(), "1.1.1.1")
 	if good.Load() != 0 {
 		t.Fatal("no-key lookup made a request")
 	}
 	service.Configure(Config{AbuseKeys: []string{"bad", "good"}})
-	result, err := service.Check(context.Background(), "node", "1.1.1.1")
+	result, err := service.Check(context.Background(), "1.1.1.1")
 	if err != nil || result.Score == nil || *result.Score != 0 || result.NetworkType() != "mobile" {
 		t.Fatalf("result=%+v err=%v", result, err)
 	}
-	_, _ = service.Check(context.Background(), "renamed-node", "1.1.1.1")
-	_, err = service.Check(context.Background(), "node", "8.8.8.8")
-	if err == nil || bad.Load() != 1 || good.Load() != 1 {
-		t.Fatalf("once/cache/failover: bad=%d good=%d err=%v", bad.Load(), good.Load(), err)
+	_, _ = service.Check(context.Background(), "1.1.1.1")
+	_, err = service.Check(context.Background(), "8.8.8.8")
+	if err != nil || bad.Load() != 1 || good.Load() != 2 {
+		t.Fatalf("cache/failover: bad=%d good=%d err=%v", bad.Load(), good.Load(), err)
+	}
+	expires := service.checks["1.1.1.1"]
+	expires.retryAfter = time.Now().Add(-time.Second)
+	service.checks["1.1.1.1"] = expires
+	if _, err := service.Check(context.Background(), "1.1.1.1"); err != nil || good.Load() != 3 {
+		t.Fatalf("expired score was not refreshed: calls=%d err=%v", good.Load(), err)
 	}
 }
 

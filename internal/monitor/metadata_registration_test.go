@@ -104,6 +104,54 @@ func TestISPNameCannotBypassNetworkFilter(t *testing.T) {
 	}
 }
 
+func TestMetadataForPreviousExitCannotOverwriteNewExit(t *testing.T) {
+	oldStarted, releaseOld := make(chan struct{}), make(chan struct{})
+	var release sync.Once
+	api := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		ip := r.URL.Query().Get("ipAddress")
+		score := 7
+		if ip == "1.1.1.1" {
+			close(oldStarted)
+			<-releaseOld
+			score = 58
+		}
+		fmt.Fprintf(w, `{"data":{"ipAddress":%q,"usageType":"Fixed Line ISP","abuseConfidenceScore":%d}}`, ip, score)
+	}))
+	defer api.Close()
+	defer release.Do(func() { close(releaseOld) })
+	m, _ := NewManager(Config{})
+	defer m.Stop()
+	m.Metadata.AbuseURL = api.URL
+	m.Metadata.Configure(ipmeta.Config{AbuseKeys: []string{"fixture"}})
+	h := m.Register(NodeInfo{Tag: "a", Name: "Original"})
+	h.SetExit("1.1.1.1", "AU", "", "", "")
+	m.EnrichExit(context.Background(), h, false)
+	select {
+	case <-oldStarted:
+	case <-time.After(3 * time.Second):
+		t.Fatal("old lookup did not start")
+	}
+	h.SetExit("8.8.8.8", "US", "", "", "")
+	m.EnrichExit(context.Background(), h, false)
+	release.Do(func() { close(releaseOld) })
+
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		snapshot := m.Snapshot()[0]
+		if snapshot.ExitIP != "8.8.8.8" || snapshot.CountryCode != "US" {
+			t.Fatalf("late lookup overwrote new exit: %+v", snapshot.NodeInfo)
+		}
+		if snapshot.Abuse != nil {
+			if snapshot.Abuse.IP != snapshot.ExitIP || *snapshot.Abuse.Score != 7 {
+				t.Fatalf("wrong exit score: %+v", snapshot.Abuse)
+			}
+			return
+		}
+		time.Sleep(time.Millisecond)
+	}
+	t.Fatal("new exit was not enriched")
+}
+
 func TestISPClassificationPendingThenNonzeroScoreExports(t *testing.T) {
 	started, release := make(chan struct{}), make(chan struct{})
 	var once sync.Once

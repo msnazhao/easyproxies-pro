@@ -3,19 +3,72 @@ package pool
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
+	"log"
 	"net"
 	"net/http"
 	"net/netip"
 	"strings"
 	"time"
 
+	"easy_proxies/internal/geoip"
 	"easy_proxies/internal/ipmeta"
 
 	M "github.com/sagernet/sing/common/metadata"
 	N "github.com/sagernet/sing/common/network"
 )
+
+var errExitProbeMismatch = errors.New("exit probes disagree")
+
+func (p *poolOutbound) scheduleExitLookup(member *memberState, activeOnly bool) {
+	entry := member.entry
+	if activeOnly && !entry.Active() {
+		return
+	}
+	if !entry.BeginExitLookup() {
+		if entry.Active() && p.monitor != nil {
+			p.monitor.RefreshExitMetadata(p.ctx, entry)
+		}
+		return
+	}
+	go func() {
+		defer entry.EndExitLookup()
+		select {
+		case exitLookupGate <- struct{}{}:
+			defer func() { <-exitLookupGate }()
+		case <-p.ctx.Done():
+			return
+		}
+		if p.ctx.Err() != nil || (activeOnly && !entry.Active()) {
+			return
+		}
+		location, err := p.lookupExit(member)
+		if p.ctx.Err() != nil {
+			return
+		}
+		if err == nil {
+			entry.SetExit(location.IP, location.ISO, location.Country, geoip.RegionForISO(location.ISO), location.Org)
+			if p.monitor != nil {
+				if entry.Active() {
+					p.monitor.RefreshExitMetadata(p.ctx, entry)
+				} else {
+					p.monitor.EnrichExit(p.ctx, entry, false)
+				}
+			}
+			return
+		}
+		if errors.Is(err, errExitProbeMismatch) {
+			entry.InvalidateExit()
+		}
+		if count := exitLookupErrors.Add(1); count <= 5 {
+			log.Printf("[pool] exit lookup failed for %s: %v", member.tag, err)
+		} else if count == 6 {
+			log.Printf("[pool] further exit lookup errors suppressed")
+		}
+	}()
+}
 
 func (p *poolOutbound) enrichExit(member *memberState, used bool) {
 	if p.monitor != nil && member.entry != nil {
@@ -66,7 +119,7 @@ func lookupExitFrom(ctx context.Context, client *http.Client, echoURL, locationU
 	}
 	observed, err := netip.ParseAddr(location.IP)
 	if err != nil || observed.Unmap() != ip {
-		return ipmeta.Location{}, fmt.Errorf("exit probes disagree: IPify saw %s, location probe saw %q", ip, location.IP)
+		return ipmeta.Location{}, fmt.Errorf("%w: IPify saw %s, location probe saw %q", errExitProbeMismatch, ip, location.IP)
 	}
 	location.IP = ip.String()
 	location.ISO = strings.ToUpper(location.ISO)

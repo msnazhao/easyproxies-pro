@@ -163,7 +163,7 @@ func (s *Server) handleProxySessionLinks(w http.ResponseWriter, r *http.Request)
 		return
 	}
 	if req.SessionID != "" && !routing.ValidSessionName(req.SessionID) {
-		writeStatusJSON(w, http.StatusBadRequest, map[string]any{"error": fmt.Sprintf("session_id 须为 1 到 %d 位字母、数字、下划线或短横线", routing.MaxSessionNameLength)})
+		writeStatusJSON(w, http.StatusBadRequest, map[string]any{"error": fmt.Sprintf("会话 ID 须为 1 到 %d 位字母、数字、下划线或短横线，或使用 _ip_ 加有效的公网 IP", routing.MaxSessionNameLength)})
 		return
 	}
 	cfg, store := s.proxyRoutingSnapshot()

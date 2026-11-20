@@ -333,16 +333,10 @@ func (s *sharedMemberState) releaseIfPermanent(now time.Time) bool {
 
 func (s *sharedMemberState) incActive() {
 	s.active.Add(1)
-	if entry := s.entry.Load(); entry != nil {
-		entry.IncActive()
-	}
 }
 
 func (s *sharedMemberState) decActive() {
 	s.active.Add(-1)
-	if entry := s.entry.Load(); entry != nil {
-		entry.DecActive()
-	}
 }
 
 func (s *sharedMemberState) activeCount() int32 {

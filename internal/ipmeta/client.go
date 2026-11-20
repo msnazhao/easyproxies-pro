@@ -61,9 +61,14 @@ type Service struct {
 	version           uint64
 	info, abuse       *provider
 	locations         map[string]Location
-	checks            map[string]Abuse
-	attempted         map[string]bool
+	checks            map[string]abuseCheck
+	lastAbusePrune    time.Time
 	InfoURL, AbuseURL string
+}
+
+type abuseCheck struct {
+	result     Abuse
+	retryAfter time.Time
 }
 type provider struct {
 	gate    chan struct{}
@@ -80,7 +85,7 @@ func newProvider() *provider {
 	}}
 }
 func New() *Service {
-	return &Service{info: newProvider(), abuse: newProvider(), locations: map[string]Location{}, checks: map[string]Abuse{}, attempted: map[string]bool{}, InfoURL: "https://api.ipinfo.io/lite/", AbuseURL: "https://api.abuseipdb.com/api/v2/check"}
+	return &Service{info: newProvider(), abuse: newProvider(), locations: map[string]Location{}, checks: map[string]abuseCheck{}, InfoURL: "https://api.ipinfo.io/lite/", AbuseURL: "https://api.abuseipdb.com/api/v2/check"}
 }
 func (s *Service) Close() {
 	s.info.client.CloseIdleConnections()
@@ -208,45 +213,68 @@ func (s *Service) Lookup(ctx context.Context, ip string) (Location, error) {
 	return result, nil
 }
 
-// Check makes one logical lookup per identity; keys may fail over inside it.
-// Identical exit IPs share a successful result without spending more quota.
-func (s *Service) Check(ctx context.Context, identity, ip string) (Abuse, error) {
+// Check shares a result and its retry interval across nodes with the same exit IP.
+func (s *Service) Check(ctx context.Context, ip string) (Abuse, error) {
+	if cached, ok := s.cachedAbuseCheck(ip); ok {
+		return cached.resultOrError()
+	}
 	if err := acquire(ctx, s.abuse); err != nil {
 		return Abuse{}, err
 	}
 	defer func() { <-s.abuse.gate }()
-	s.mu.Lock()
-	keys := append([]string(nil), s.cfg.AbuseKeys...)
-	cached, ok := s.checks[ip]
-	if ok {
-		s.mu.Unlock()
-		return cached, nil
+	if cached, ok := s.cachedAbuseCheck(ip); ok {
+		return cached.resultOrError()
 	}
-	if len(keys) == 0 || s.attempted[identity] {
-		s.mu.Unlock()
+	s.mu.RLock()
+	keys := append([]string(nil), s.cfg.AbuseKeys...)
+	s.mu.RUnlock()
+	if len(keys) == 0 {
 		return Abuse{}, fmt.Errorf("abuse lookup skipped")
 	}
-	s.attempted[identity] = true
-	s.mu.Unlock()
 	var result struct {
 		Data Abuse `json:"data"`
 	}
 	err := s.abuse.request(ctx, keys, s.AbuseURL+"?ipAddress="+url.QueryEscape(ip)+"&maxAgeInDays=90", true, &result, nil)
 	if ctx.Err() != nil {
-		s.mu.Lock()
-		delete(s.attempted, identity)
-		s.mu.Unlock()
+		return Abuse{}, ctx.Err()
 	}
+	if err == nil && (result.Data.IP != ip || result.Data.Score != nil && (*result.Data.Score < 0 || *result.Data.Score > 100)) {
+		err = fmt.Errorf("invalid AbuseIPDB response")
+	}
+	now := time.Now()
+	check := abuseCheck{result: result.Data, retryAfter: now.Add(24 * time.Hour)}
+	if err != nil {
+		check = abuseCheck{retryAfter: now.Add(time.Hour)}
+	}
+	s.mu.Lock()
+	if now.Sub(s.lastAbusePrune) >= time.Hour {
+		for address, cached := range s.checks {
+			if !now.Before(cached.retryAfter) {
+				delete(s.checks, address)
+			}
+		}
+		s.lastAbusePrune = now
+	}
+	s.checks[ip] = check
+	s.mu.Unlock()
 	if err != nil {
 		return Abuse{}, err
 	}
-	if result.Data.IP != ip || result.Data.Score != nil && (*result.Data.Score < 0 || *result.Data.Score > 100) {
-		return Abuse{}, fmt.Errorf("invalid AbuseIPDB response")
-	}
-	s.mu.Lock()
-	s.checks[ip] = result.Data
-	s.mu.Unlock()
 	return result.Data, nil
+}
+
+func (s *Service) cachedAbuseCheck(ip string) (abuseCheck, bool) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	check := s.checks[ip]
+	return check, time.Now().Before(check.retryAfter)
+}
+
+func (c abuseCheck) resultOrError() (Abuse, error) {
+	if c.result.IP == "" {
+		return Abuse{}, fmt.Errorf("abuse lookup on cooldown")
+	}
+	return c.result, nil
 }
 
 func Hosting(org string) bool {

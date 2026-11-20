@@ -77,6 +77,8 @@ func TestProxySessionLinks(t *testing.T) {
 	}{
 		{"named HTTP", "", "dashboard.example:9091", "wang", "1234", "account-1", "http", "dashboard.example:2323"},
 		{"named SOCKS5", "", "localhost:9091", "wang", "1234", "Account_2", "socks5", "localhost:2323"},
+		{"exit IPv4", "", "localhost:9091", "wang", "1234", "_ip_8.8.8.8", "http", "localhost:2323"},
+		{"exit IPv6", "", "localhost:9091", "wang", "1234", "_ip_2606-4700--1111", "socks5", "localhost:2323"},
 		{"ordinary HTTP", "", "localhost:9091", "wang", "1234", "", "", "localhost:2323"},
 		{"external wins", "proxy.example", "internal.example:9091", "wang", "1234", "one", "http", "proxy.example:2323"},
 		{"external IPv6", "2001:db8::7", "internal.example:9091", "wang", "1234", "one", "http", "[2001:db8::7]:2323"},

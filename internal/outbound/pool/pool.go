@@ -16,7 +16,6 @@ import (
 	"sync/atomic"
 	"time"
 
-	"easy_proxies/internal/geoip"
 	"easy_proxies/internal/monitor"
 	"easy_proxies/internal/routing"
 
@@ -318,6 +317,15 @@ func (p *poolOutbound) initializeMembersLocked() error {
 }
 
 func (p *poolOutbound) DialContext(ctx context.Context, network string, destination M.Socksaddr) (net.Conn, error) {
+	exitIP := routing.ExitIPFromContext(ctx)
+	if exitIP.IsValid() {
+		if !p.options.SessionRouting {
+			return nil, errExitSessionDisabled
+		}
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, exitSessionDialTimeout)
+		defer cancel()
+	}
 	key := routing.SessionFromContext(ctx)
 	fastest := routing.ParseFastestRoute(key)
 	lease, binding, err := p.acquireSession(ctx, key, fastest)
@@ -334,7 +342,7 @@ func (p *poolOutbound) DialContext(ctx context.Context, network string, destinat
 	}
 	singleMember := len(p.options.Members) <= 1
 	var tried map[string]bool
-	if !singleMember && maxAttempts > 1 {
+	if (!singleMember || exitIP.IsValid()) && maxAttempts > 1 {
 		tried = make(map[string]bool, maxAttempts)
 	}
 	var lastErr error
@@ -344,7 +352,9 @@ func (p *poolOutbound) DialContext(ctx context.Context, network string, destinat
 			return nil, err
 		}
 		var member *memberState
-		if lease != nil {
+		if exitIP.IsValid() {
+			member, err = p.pickExitIP(network, tried, exitIP)
+		} else if lease != nil {
 			member, err = p.pickMemberForSession(network, tried, pinned)
 		} else if fastest.Enabled && p.options.SessionRouting {
 			member, err = p.pickFastest(network, tried, fastest)
@@ -359,6 +369,7 @@ func (p *poolOutbound) DialContext(ctx context.Context, network string, destinat
 		}
 		p.incActive(member)
 		conn, dialErr := member.outbound.DialContext(ctx, network, destination)
+		dialErr = checkDialedExit(conn, dialErr, member, exitIP)
 		if dialErr != nil {
 			p.decActive(member)
 			// A caller cancellation is not evidence of an unhealthy upstream.
@@ -367,7 +378,7 @@ func (p *poolOutbound) DialContext(ctx context.Context, network string, destinat
 			}
 			if lease != nil && pinned != "" && p.memberIdentity(member) == pinned {
 				p.recordPinFailure(member, dialErr)
-			} else {
+			} else if !errors.Is(dialErr, errExitChanged) {
 				p.recordFailure(member, dialErr)
 			}
 			lastErr = dialErr
@@ -413,6 +424,15 @@ func (p *poolOutbound) DialContext(ctx context.Context, network string, destinat
 }
 
 func (p *poolOutbound) ListenPacket(ctx context.Context, destination M.Socksaddr) (net.PacketConn, error) {
+	exitIP := routing.ExitIPFromContext(ctx)
+	if exitIP.IsValid() {
+		if !p.options.SessionRouting {
+			return nil, errExitSessionDisabled
+		}
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, exitSessionDialTimeout)
+		defer cancel()
+	}
 	key := routing.SessionFromContext(ctx)
 	fastest := routing.ParseFastestRoute(key)
 	lease, binding, err := p.acquireSession(ctx, key, fastest)
@@ -429,7 +449,7 @@ func (p *poolOutbound) ListenPacket(ctx context.Context, destination M.Socksaddr
 	}
 	singleMember := len(p.options.Members) <= 1
 	var tried map[string]bool
-	if !singleMember && maxAttempts > 1 {
+	if (!singleMember || exitIP.IsValid()) && maxAttempts > 1 {
 		tried = make(map[string]bool, maxAttempts)
 	}
 	var lastErr error
@@ -439,7 +459,9 @@ func (p *poolOutbound) ListenPacket(ctx context.Context, destination M.Socksaddr
 			return nil, err
 		}
 		var member *memberState
-		if lease != nil {
+		if exitIP.IsValid() {
+			member, err = p.pickExitIP(N.NetworkUDP, tried, exitIP)
+		} else if lease != nil {
 			// UDP may use the TCP pin if supported, but capability filtering and
 			// packet retries must never migrate the primary TCP binding.
 			member, err = p.pickMemberForSession(N.NetworkUDP, tried, pinned)
@@ -456,6 +478,7 @@ func (p *poolOutbound) ListenPacket(ctx context.Context, destination M.Socksaddr
 		}
 		p.incActive(member)
 		conn, listenErr := member.outbound.ListenPacket(ctx, destination)
+		listenErr = checkDialedExit(conn, listenErr, member, exitIP)
 		if listenErr != nil {
 			p.decActive(member)
 			if err := ctx.Err(); err != nil {
@@ -464,7 +487,9 @@ func (p *poolOutbound) ListenPacket(ctx context.Context, destination M.Socksaddr
 			// The pin is a TCP binding reused opportunistically for UDP, so a
 			// packet failure is not evidence that its TCP dial path is dead and
 			// must not blacklist the node.
-			p.recordFailure(member, listenErr)
+			if !errors.Is(listenErr, errExitChanged) {
+				p.recordFailure(member, listenErr)
+			}
 			lastErr = listenErr
 			if tried != nil {
 				tried[member.tag] = true
@@ -998,13 +1023,17 @@ func (p *poolOutbound) recordSuccess(member *memberState) {
 }
 
 func (p *poolOutbound) wrapConn(conn net.Conn, member *memberState) net.Conn {
+	member.entry.IncActive()
 	return &trackedConn{Conn: conn, release: func() {
+		member.entry.DecActive()
 		p.decActive(member)
 	}}
 }
 
 func (p *poolOutbound) wrapPacketConn(conn net.PacketConn, member *memberState) net.PacketConn {
+	member.entry.IncActive()
 	return &trackedPacketConn{PacketConn: conn, release: func() {
+		member.entry.DecActive()
 		p.decActive(member)
 	}}
 }
@@ -1126,30 +1155,7 @@ func (p *poolOutbound) probeMember(ctx context.Context, member *memberState, des
 	if member.entry != nil {
 		member.entry.RecordSuccessWithLatency(duration)
 	}
-	// Exit discovery is independent of the periodic latency probe. It is only
-	// attempted after a successful probe and stops once an exit was confirmed.
-	if member.entry != nil && member.entry.BeginExitLookup() {
-		entry := member.entry
-		go func() {
-			defer entry.EndExitLookup()
-			select {
-			case exitLookupGate <- struct{}{}:
-				defer func() { <-exitLookupGate }()
-			case <-p.ctx.Done():
-				return
-			}
-			if location, lookupErr := p.lookupExit(member); lookupErr == nil {
-				entry.SetExit(location.IP, location.ISO, location.Country, geoip.RegionForISO(location.ISO), location.Org)
-				if p.monitor != nil {
-					p.monitor.EnrichExit(p.ctx, entry, false)
-				}
-			} else if count := exitLookupErrors.Add(1); count <= 5 {
-				log.Printf("[pool] exit lookup failed for %s: %v", member.tag, lookupErr)
-			} else if count == 6 {
-				log.Printf("[pool] further exit lookup errors suppressed")
-			}
-		}()
-	}
+	p.scheduleExitLookup(member, monitor.IsPeriodicProbe(ctx))
 	// Clear a permanent pool blacklist on successful probe — a node that passes
 	// the health check should be available for selection immediately (fixes #8,
 	// #9). A live transient / rate-limit cooldown is deliberately preserved: the

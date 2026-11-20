@@ -163,7 +163,7 @@ GeoIP 路由器复用 `listener.username` 和 `listener.password` 进行代理�
 
 - 首次启动时会自动下载 MaxMind GeoLite2-Country 数据库。
 - 默认每 24 小时检查更新，并热重载数据库，无需重启。
-- 健康探测首次成功后通过节点查询公网出口 IP、国家和网络提供商；仪表盘地区过滤与地区路由均按出口 IP 归属分类，入口服务器 IP 只用于入口位置诊断。成功取得后周期探测不重复查询，订阅更新或核心重载后重新检测。
+- 健康探测首次成功后通过节点查询公网出口 IP、国家和网络提供商。仪表盘地区过滤与地区路由均按出口 IP 归属分类。周期检查仅覆盖当前有代理连接的节点，启动、重载和手动探测可发现空闲节点。
 - 健康检查默认使用 HTTPS 并严格校验证书；失败的代理立即拉黑，按 `pool.blacklist_duration` 到期或人工解封。只有主动开启 `skip_cert_verify` 才会跳过证书校验，探测仍通过 HTTPS 进行。
 - `other` 仅包含已确认出口属于其他国家的节点；出口信息未知的节点不会被国家路由选中。入口国家来自 GeoIP 数据库，跨国中转在监控列表显示为入口 → 出口。
 
@@ -180,6 +180,8 @@ GeoIP 路由器复用 `listener.username` 和 `listener.password` 进行代理�
 使用 `._fast1_us_` 限制美国出口，`._fast1_gb_` 限制英国出口，也支持其他两位国家代码；没有匹配的健康节点时请求失败，不跨国家回退。
 
 在会话路由页面选择「ISP · AbuseIPDB 最低分」，或使用 `基础用户名._fast1_isp_`。每次新连接从已有 AbuseIPDB 评分的健康固定线路或移动 ISP 节点中选择最低分的出口，分数相同时选实测延迟最低的。请配置 `ip_metadata.abuseipdb_keys` 以获取评分。没有合格节点时，连接失败。
+
+使用 `基础用户名._ip_8.8.8.8` 指定公网出口。路由在同 IP 的健康节点中按延迟选择，有效候选用尽后返回连接错误。会话路由页面可生成 IPv4 和 IPv6 接入链接。详见 [按出口 IP 路由](docs/exit-ip-routing.md)。
 
 ### 使用方法
 
@@ -294,7 +296,7 @@ dns:
 
 系统设置新增 IPinfo 和 AbuseIPDB key 列表，每行一个，保存至 `config.yaml` 的 `ip_metadata.ipinfo_keys` 和 `ip_metadata.abuseipdb_keys`。配置文件包含凭据，请限制访问。出口探测优先经节点请求 IPinfo Lite 的 `/lite/me`，再用 IPify 复核；没有可用的 IPinfo key 时，先用 IPify，再用 `ipapi.co` 复核。两者返回的 IP 一致才记录出口；可用时国家、ASN 和组织以 IPinfo Lite 为准。IPinfo 和 AbuseIPDB 各自串行执行，认证或配额失败时切换 key 并冷却。
 
-AbuseIPDB 没有 key 时不请求。出口发现后，排除 Amazon、Microsoft、Oracle、Google、OVH、GTHost、Melbikomas、Alibaba、Tencent、Greenhost、DigitalOcean、M247、Datacamp、Contabo、ByteVirt、VMISS 及组织名包含 host/cloud 的节点，其他节点查询使用类型和最近 90 天的风险分数。被排除的节点在实际代理连接成功使用后才查询。每个稳定节点身份在进程生命周期内只进行一次逻辑查询，故障 key 可在该次查询中轮换；相同出口 IP 共享成功结果，订阅刷新和核心重载不会重复查询。取消中的查询可以重试，程序重启会清空内存缓存。
+AbuseIPDB 没有 key 时不请求。出口发现后，已知机房组织等到实际代理连接成功后再查询，其他节点在发现阶段查询使用类型和最近 90 天的风险分数。相同出口 IP 共享 24 小时缓存，失败后间隔至少 1 小时再查。周期刷新覆盖活跃节点，出口变化后按新 IP 查询。程序重启会清空内存缓存。
 
 显示和导出名称为 `ISP|分数|国家代码|出口IP|org简称|原名`，未确认 ISP 或没有分数时省略对应字段，0 分会保留。只有 `Fixed Line ISP` 和 `Mobile ISP` 才加 ISP 前缀；原始配置名称不覆盖。API 保留完整 usageType、ISP、举报数量、不同举报人数量、最后举报时间、域名和 isTor。AbuseIPDB 不提供独立 VPN/代理判定，缺失信息保持未知，也不覆盖 IPinfo 的国家和组织。运营商简称字段为 `org_short`，完整名称仍在 `provider`。
 

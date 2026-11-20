@@ -362,6 +362,38 @@ func TestSessionRoutingLocalHTTPConnectAndSOCKS(t *testing.T) {
 	}
 }
 
+func TestSessionRoutingLocalStrictExit(t *testing.T) {
+	a, b := newSessionLocalUpstream(t, "node-a"), newSessionLocalUpstream(t, "node-b")
+	m, cfg := startSessionLocalManager(t, a, b, nil)
+	for _, node := range m.monitorMgr.Snapshot() {
+		entry := m.monitorMgr.Register(node.NodeInfo)
+		entry.MarkInitialCheckDone(true)
+		entry.RecordSuccessWithLatency(time.Millisecond)
+		exit := "1.1.1.1"
+		if node.Name == "node-b" {
+			exit = "8.8.8.8"
+		}
+		entry.SetExit(exit, "", "", "", "")
+	}
+	for _, call := range []func(*testing.T, *config.Config, string) string{
+		sessionLocalHTTPNode, sessionLocalCONNECTNode, sessionLocalSOCKSNode,
+	} {
+		if got := call(t, cfg, "wang._ip_8.8.8.8"); got != "node-b" {
+			t.Fatalf("strict IP route used %q, want node-b", got)
+		}
+	}
+	conn := sessionLocalDial(t, cfg)
+	defer conn.Close()
+	response, err := sessionLocalHTTPResponse(conn, bufio.NewReader(conn), "wang._ip_9.9.9.9", "1234", true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	response.Body.Close()
+	if response.StatusCode != http.StatusBadGateway {
+		t.Fatalf("missing requested exit returned HTTP %d", response.StatusCode)
+	}
+}
+
 func TestSessionRoutingLocalAuthenticationRejectsInvalidCredentials(t *testing.T) {
 	a, b := newSessionLocalUpstream(t, "node-a"), newSessionLocalUpstream(t, "node-b")
 	m, cfg := startSessionLocalManager(t, a, b, nil)

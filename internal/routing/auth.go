@@ -15,6 +15,9 @@ func ValidSessionName(name string) bool {
 	if len(name) < 1 || len(name) > MaxSessionNameLength {
 		return false
 	}
+	if ip, reserved := ParseExitSession(name); reserved {
+		return ip.IsValid()
+	}
 	for _, ch := range []byte(name) {
 		if ch >= 'a' && ch <= 'z' || ch >= 'A' && ch <= 'Z' || ch >= '0' && ch <= '9' || ch == '_' || ch == '-' {
 			continue

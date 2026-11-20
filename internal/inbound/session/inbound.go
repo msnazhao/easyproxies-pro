@@ -153,7 +153,9 @@ func (h *Inbound) authenticate(ctx context.Context, username, password string) (
 	for _, user := range h.users {
 		name, ok := routing.VerifyProxyCredentials(user.Username, user.Password, username, password, h.sessionEnabled)
 		if ok {
-			if name != "" {
+			if ip, reserved := routing.ParseExitSession(name); reserved {
+				ctx = routing.WithExitIP(ctx, ip)
+			} else if name != "" {
 				ctx = routing.WithSession(ctx, username)
 			}
 			return auth.ContextWithUser(ctx, username), true

@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"net/netip"
 	"sort"
 	"strconv"
 	"strings"
@@ -74,6 +75,7 @@ type Snapshot struct {
 	LastFailure       time.Time       `json:"last_failure,omitempty"`
 	LastSuccess       time.Time       `json:"last_success,omitempty"`
 	LastProbeLatency  time.Duration   `json:"last_probe_latency,omitempty"`
+	ExitVerifiedAt    time.Time       `json:"exit_verified_at,omitzero"`
 	LastLatencyMs     int64           `json:"last_latency_ms"`
 	Available         bool            `json:"available"`
 	InitialCheckDone  bool            `json:"initial_check_done"`
@@ -82,6 +84,14 @@ type Snapshot struct {
 
 type probeFunc func(ctx context.Context) (time.Duration, error)
 type releaseFunc func()
+
+type periodicProbeKey struct{}
+
+// IsPeriodicProbe reports whether a probe came from the active-node sweep.
+func IsPeriodicProbe(ctx context.Context) bool {
+	periodic, _ := ctx.Value(periodicProbeKey{}).(bool)
+	return periodic
+}
 
 // probeRun coalesces callers for one node. A protocol dial that ignores context
 // can retain at most one callback goroutine per entry, not one per HTTP request.
@@ -101,6 +111,7 @@ type entry struct {
 	metadataUsed      bool
 	metadataVersion   uint64
 	metadataUsageDone bool
+	nextAbuseCheck    time.Time
 	info              NodeInfo
 	failure           int
 	success           int64
@@ -111,11 +122,16 @@ type entry struct {
 	lastFail          time.Time
 	lastOK            time.Time
 	lastProbe         time.Duration
+	lastProbeAt       time.Time
 	active            atomic.Int32
 	probe             probeFunc
 	probeRun          *probeRun
 	probeGeneration   uint64
 	exitPending       bool
+	exitIP            netip.Addr
+	exitVerifiedAt    time.Time
+	exitAttemptedAt   time.Time
+	exitGeneration    uint64
 	release           releaseFunc
 	blacklistFn       func(time.Duration)
 	initialCheckDone  bool
@@ -158,6 +174,7 @@ type Manager struct {
 	probeGate      sync.Mutex
 	sweepRunning   bool
 	rerunRequested bool
+	rerunAll       bool
 }
 
 // ProbeSweepProgress reports the current health-check sweep progress. active is
@@ -278,7 +295,7 @@ func (m *Manager) SetProbeTarget(probeTarget string, skipCertVerify bool) {
 	m.mu.Unlock()
 }
 
-// StartPeriodicHealthCheck starts a background goroutine that periodically checks all nodes.
+// StartPeriodicHealthCheck discovers nodes at startup and periodically checks nodes in use.
 // interval: how often to check (e.g., 30 * time.Second)
 // timeout: timeout for each probe (e.g., 10 * time.Second)
 func (m *Manager) StartPeriodicHealthCheck(interval, timeout time.Duration) {
@@ -309,7 +326,7 @@ func (m *Manager) StartPeriodicHealthCheck(interval, timeout time.Duration) {
 			case <-m.ctx.Done():
 				return
 			case <-ticker.C:
-				m.probeAllNodes(timeout)
+				m.probeNodes(timeout, true)
 			}
 		}
 	}()
@@ -331,6 +348,10 @@ func (m *Manager) ProbeAllNow(timeout time.Duration) {
 // sweeps that would corrupt the shared progress counters and wedge the WebUI
 // progress bar "active" flag on.
 func (m *Manager) probeAllNodes(timeout time.Duration) {
+	m.probeNodes(timeout, false)
+}
+
+func (m *Manager) probeNodes(timeout time.Duration, activeOnly bool) {
 	if m.ctx.Err() != nil {
 		return
 	}
@@ -339,6 +360,7 @@ func (m *Manager) probeAllNodes(timeout time.Duration) {
 		// A sweep is running: request one follow-up pass and return. The running
 		// sweep will pick this up when it drains the gate.
 		m.rerunRequested = true
+		m.rerunAll = m.rerunAll || !activeOnly
 		m.probeGate.Unlock()
 		return
 	}
@@ -346,15 +368,18 @@ func (m *Manager) probeAllNodes(timeout time.Duration) {
 	m.probeGate.Unlock()
 
 	for {
-		m.runProbeSweep(timeout)
+		m.runProbeSweep(timeout, activeOnly)
 
 		m.probeGate.Lock()
 		if m.rerunRequested && m.ctx.Err() == nil {
+			activeOnly = !m.rerunAll
 			m.rerunRequested = false
+			m.rerunAll = false
 			m.probeGate.Unlock()
 			continue // A trigger arrived mid-sweep; run exactly one more pass.
 		}
 		m.rerunRequested = false
+		m.rerunAll = false
 		m.sweepRunning = false
 		m.probeGate.Unlock()
 		return
@@ -364,7 +389,7 @@ func (m *Manager) probeAllNodes(timeout time.Duration) {
 // runProbeSweep checks all registered nodes concurrently. It is only ever
 // invoked by probeAllNodes, which guarantees single-flight execution, so the
 // shared probeSweep* progress counters are never written by two sweeps at once.
-func (m *Manager) runProbeSweep(timeout time.Duration) {
+func (m *Manager) runProbeSweep(timeout time.Duration, activeOnly bool) {
 	if m.ctx.Err() != nil {
 		return
 	}
@@ -372,7 +397,9 @@ func (m *Manager) runProbeSweep(timeout time.Duration) {
 	logger := m.logger
 	entries := make([]*entry, 0, len(m.nodes))
 	for _, e := range m.nodes {
-		entries = append(entries, e)
+		if !activeOnly || e.active.Load() > 0 {
+			entries = append(entries, e)
+		}
 	}
 	m.mu.RUnlock()
 
@@ -436,9 +463,16 @@ func (m *Manager) runProbeSweep(timeout time.Duration) {
 		go func(entry *entry, tag string) {
 			defer wg.Done()
 			defer func() { <-sem }()
+			if activeOnly && entry.active.Load() <= 0 {
+				m.probeSweepDone.Add(1)
+				return
+			}
 
 			ctx, cancel := context.WithTimeout(m.ctx, timeout)
 			defer cancel()
+			if activeOnly {
+				ctx = context.WithValue(ctx, periodicProbeKey{}, true)
+			}
 
 			latency, err, authoritative, generation := entry.waitProbe(ctx)
 			// Shutdown/client cancellation says nothing about a node's health.
@@ -663,6 +697,7 @@ func (e *entry) applyProbeResult(generation uint64, latency time.Duration, err e
 		e.lastOK = time.Now()
 		e.lastError = ""
 		e.lastProbe = latency
+		e.lastProbeAt = e.lastOK
 		e.available = true
 	}
 	return true
@@ -782,6 +817,7 @@ func (e *entry) snapshot() Snapshot {
 		LastFailure:       e.lastFail,
 		LastSuccess:       e.lastOK,
 		LastProbeLatency:  e.lastProbe,
+		ExitVerifiedAt:    e.exitVerifiedAt,
 		LastLatencyMs:     latencyMs,
 		Available:         e.available,
 		InitialCheckDone:  e.initialCheckDone,
@@ -815,6 +851,7 @@ func (e *entry) recordSuccessWithLatency(latency time.Duration) {
 	e.lastOK = time.Now()
 	e.lastError = ""
 	e.lastProbe = latency
+	e.lastProbeAt = e.lastOK
 	latencyMs := latency.Milliseconds()
 	if latencyMs == 0 && latency > 0 {
 		latencyMs = 1
@@ -988,22 +1025,52 @@ func (h *EntryHandle) LastLatency() time.Duration {
 	return h.ref.lastProbe
 }
 
-// SetExit updates location only after a validated exit lookup. An unsuccessful
-// lookup leaves the node unclassified so a later successful check may retry.
+const (
+	exitRefreshInterval = 15 * time.Minute
+	exitRoutingTTL      = 30 * time.Minute
+)
+
+// SetExit publishes a verified address and discards metadata belonging to the old address.
 func (h *EntryHandle) SetExit(ip, iso, country, region, provider string) {
 	if h == nil || h.ref == nil {
 		return
 	}
-	h.ref.mu.Lock()
-	defer h.ref.mu.Unlock()
-	if h.ref.info.ExitIP != "" {
+	address, err := netip.ParseAddr(ip)
+	if err != nil {
 		return
 	}
-	h.ref.info.ExitIP = ip
+	address = address.Unmap()
+	h.ref.mu.Lock()
+	defer h.ref.mu.Unlock()
+	h.ref.exitVerifiedAt = time.Now()
+	if h.ref.exitIP != address {
+		h.ref.clearExitMetadata()
+	}
+	h.ref.exitIP = address
+	h.ref.info.ExitIP = address.String()
 	h.ref.info.CountryCode = iso
 	h.ref.info.Country = country
 	h.ref.info.Region = region
 	h.ref.info.Provider = provider
+	formatNodeName(&h.ref.info)
+}
+
+// InvalidateExit withdraws a conflicting exit observation from strict routing.
+func (h *EntryHandle) InvalidateExit() {
+	h.ref.mu.Lock()
+	defer h.ref.mu.Unlock()
+	h.ref.clearExitMetadata()
+	h.ref.exitIP = netip.Addr{}
+	h.ref.exitVerifiedAt = time.Time{}
+	formatNodeName(&h.ref.info)
+}
+
+func (e *entry) clearExitMetadata() {
+	copyExitMetadata(&e.info, NodeInfo{})
+	e.exitGeneration++
+	e.metadataVersion = 0
+	e.metadataUsageDone = false
+	e.nextAbuseCheck = time.Time{}
 }
 
 // BeginExitLookup coalesces concurrent checks of the same node.
@@ -1013,11 +1080,34 @@ func (h *EntryHandle) BeginExitLookup() bool {
 	}
 	h.ref.mu.Lock()
 	defer h.ref.mu.Unlock()
-	if h.ref.exitPending || h.ref.info.ExitIP != "" {
+	now := time.Now()
+	if h.ref.exitPending || now.Sub(h.ref.exitVerifiedAt) < exitRefreshInterval ||
+		now.Sub(h.ref.exitAttemptedAt) < time.Minute {
 		return false
 	}
 	h.ref.exitPending = true
+	h.ref.exitAttemptedAt = now
 	return true
+}
+
+// ExitRouteLatency returns the measured latency of a healthy, recently verified exit.
+func (h *EntryHandle) ExitRouteLatency(ip netip.Addr, now time.Time) time.Duration {
+	if h == nil || h.ref == nil {
+		return 0
+	}
+	e := h.ref
+	e.mu.RLock()
+	defer e.mu.RUnlock()
+	if e.exitIP != ip || now.Sub(e.exitVerifiedAt) >= exitRoutingTTL ||
+		now.Sub(e.lastProbeAt) >= exitRoutingTTL || !e.initialCheckDone || !e.available ||
+		e.blacklist && (e.until.IsZero() || now.Before(e.until)) {
+		return 0
+	}
+	return e.lastProbe
+}
+
+func (h *EntryHandle) Active() bool {
+	return h != nil && h.ref != nil && h.ref.active.Load() > 0
 }
 
 func (h *EntryHandle) EndExitLookup() {

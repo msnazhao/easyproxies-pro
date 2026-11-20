@@ -122,6 +122,7 @@ func TestHTTPAuthenticationRejectedWithoutLeakingCredentials(t *testing.T) {
 	for i, header := range []string{
 		"", basicHeader("wang.name.xyz", "incorrect"), basicHeader("wang.name.", "secret"),
 		basicHeader("wang.name.bad.dot", "secret"), basicHeader("other.xyz", "secret"), "Basic invalid-base64",
+		basicHeader("wang.name._ip_invalid", "secret"), basicHeader("wang.name._ip_10.0.0.2", "secret"),
 	} {
 		t.Run(fmt.Sprintf("case_%d", i), func(t *testing.T) {
 			client, closed := startTestConnection(t, &testRouter{tcp: func(context.Context, net.Conn, adapter.InboundContext, N.CloseHandlerFunc) {

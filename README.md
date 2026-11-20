@@ -215,6 +215,8 @@ Use `._fast1_us_` or `._fast1_gb_` to restrict selection to a measured US or GB 
 
 Use `username._fast1_isp_` to select the healthy fixed-line or mobile ISP exit with the lowest known AbuseIPDB score. If scores tie, the exit with the lowest measured latency wins. Configure `ip_metadata.abuseipdb_keys` to obtain scores. The route selects an exit on every new connection and fails if no eligible ISP exit has a score.
 
+Use `username._ip_8.8.8.8` to select the lowest-latency healthy node with a recent verification of that exit IP. Retries stay within the requested IP. The session page generates links for both IPv4 and IPv6. See [exit IP routing](docs/exit-ip-routing.md) for verification and retry rules.
+
 ### Supported Regions
 
 | Code | Region |
@@ -304,7 +306,7 @@ ip_metadata:
   abuseipdb_keys: [YOUR_ABUSEIPDB_KEY]
 ```
 
-Exit discovery first asks IPinfo Lite (`/lite/me`) through the node when an IPinfo key is configured, then checks the observed IP against IPify. Without a usable IPinfo key, it starts with IPify and verifies the result with `ipapi.co`. The node remains unclassified until the two providers agree. IPinfo Lite is authoritative for country, ASN and organization when available. Each metadata provider has a separate single-request lane, HTTP keep-alive, key failover, and cooldown on authentication/quota failures. AbuseIPDB is disabled without keys. It checks non-hosting organizations after exit discovery; known hosting providers are checked only after real traffic successfully uses the node. Checks use 90 days of reports, share results for identical exit IPs, and are attempted once per stable node identity during the process lifetime, including subscription refreshes/core reloads. Cancellation permits a later attempt. Restarting the process clears this in-memory cache.
+Exit discovery first asks IPinfo Lite (`/lite/me`) through the node when an IPinfo key is configured, then checks the observed IP against IPify. Without a usable IPinfo key, it starts with IPify and verifies the result with `ipapi.co`. The node remains unclassified until the two providers agree. IPinfo Lite is authoritative for country, ASN and organization when available. Each metadata provider has a separate single-request lane, HTTP keep-alive, key failover, and cooldown on authentication or quota failures. AbuseIPDB checks non-hosting organizations after discovery and known hosting providers after their first successful use. Scores use 90 days of reports and are cached by exit IP for 24 hours. Subsequent checks run for active nodes when due. Restarting the process clears this in-memory cache.
 
 Node display/export names are `ISP|score|country-code|exit-IP|short-org|original-name`, omitting the ISP marker and score when unavailable. Zero is a valid score. Only AbuseIPDB `Fixed Line ISP`/`Mobile ISP` usage types qualify for the ISP marker. Its score is report confidence (0-100), not a probability of maliciousness; `isTor` is kept separately. This API supplies no definitive VPN/proxy flags, so these remain unknown. Country and organization are never overwritten by AbuseIPDB. Original names/URIs remain intact in configuration, and names are recomputed without accumulating prefixes.
 
