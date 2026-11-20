@@ -88,10 +88,11 @@ type releaseFunc func()
 
 type periodicProbeKey struct{}
 
-// IsPeriodicProbe reports whether a probe came from the active-node sweep.
-func IsPeriodicProbe(ctx context.Context) bool {
-	periodic, _ := ctx.Value(periodicProbeKey{}).(bool)
-	return periodic
+// PeriodicProbeSince returns the activity cutoff for a periodic probe.
+// Startup and manual probes have no activity cutoff.
+func PeriodicProbeSince(ctx context.Context) time.Time {
+	since, _ := ctx.Value(periodicProbeKey{}).(time.Time)
+	return since
 }
 
 // probeRun coalesces callers for one node. A protocol dial that ignores context
@@ -125,6 +126,7 @@ type entry struct {
 	lastProbe         time.Duration
 	lastProbeAt       time.Time
 	active            atomic.Int32
+	lastUsedAt        atomic.Int64
 	probe             probeFunc
 	probeRun          *probeRun
 	probeGeneration   uint64
@@ -152,6 +154,7 @@ type Manager struct {
 	probeConcurrency int
 	mu               sync.RWMutex
 	nodes            map[string]*entry
+	reloadMeasures   map[string]nodeMeasurements
 	ctx              context.Context
 	cancel           context.CancelFunc
 	logger           Logger
@@ -175,7 +178,7 @@ type Manager struct {
 	probeGate      sync.Mutex
 	sweepRunning   bool
 	rerunRequested bool
-	rerunAll       bool
+	rerunSince     time.Time
 }
 
 // ProbeSweepProgress reports the current health-check sweep progress. active is
@@ -296,7 +299,7 @@ func (m *Manager) SetProbeTarget(probeTarget string, skipCertVerify bool) {
 	m.mu.Unlock()
 }
 
-// StartPeriodicHealthCheck discovers nodes at startup and periodically checks nodes in use.
+// StartPeriodicHealthCheck discovers nodes at startup and checks recently used nodes.
 // interval: how often to check (e.g., 30 * time.Second)
 // timeout: timeout for each probe (e.g., 10 * time.Second)
 func (m *Manager) StartPeriodicHealthCheck(interval, timeout time.Duration) {
@@ -327,7 +330,7 @@ func (m *Manager) StartPeriodicHealthCheck(interval, timeout time.Duration) {
 			case <-m.ctx.Done():
 				return
 			case <-ticker.C:
-				m.probeNodes(timeout, true)
+				m.probeNodes(timeout, time.Now().Add(-interval))
 			}
 		}
 	}()
@@ -349,10 +352,10 @@ func (m *Manager) ProbeAllNow(timeout time.Duration) {
 // sweeps that would corrupt the shared progress counters and wedge the WebUI
 // progress bar "active" flag on.
 func (m *Manager) probeAllNodes(timeout time.Duration) {
-	m.probeNodes(timeout, false)
+	m.probeNodes(timeout, time.Time{})
 }
 
-func (m *Manager) probeNodes(timeout time.Duration, activeOnly bool) {
+func (m *Manager) probeNodes(timeout time.Duration, since time.Time) {
 	if m.ctx.Err() != nil {
 		return
 	}
@@ -360,8 +363,10 @@ func (m *Manager) probeNodes(timeout time.Duration, activeOnly bool) {
 	if m.sweepRunning {
 		// A sweep is running: request one follow-up pass and return. The running
 		// sweep will pick this up when it drains the gate.
+		if !m.rerunRequested || since.Before(m.rerunSince) {
+			m.rerunSince = since
+		}
 		m.rerunRequested = true
-		m.rerunAll = m.rerunAll || !activeOnly
 		m.probeGate.Unlock()
 		return
 	}
@@ -369,28 +374,27 @@ func (m *Manager) probeNodes(timeout time.Duration, activeOnly bool) {
 	m.probeGate.Unlock()
 
 	for {
-		m.runProbeSweep(timeout, activeOnly)
+		m.runProbeSweep(timeout, since)
 
 		m.probeGate.Lock()
 		if m.rerunRequested && m.ctx.Err() == nil {
-			activeOnly = !m.rerunAll
+			since = m.rerunSince
 			m.rerunRequested = false
-			m.rerunAll = false
 			m.probeGate.Unlock()
 			continue // A trigger arrived mid-sweep; run exactly one more pass.
 		}
 		m.rerunRequested = false
-		m.rerunAll = false
+		m.rerunSince = time.Time{}
 		m.sweepRunning = false
 		m.probeGate.Unlock()
 		return
 	}
 }
 
-// runProbeSweep checks all registered nodes concurrently. It is only ever
-// invoked by probeAllNodes, which guarantees single-flight execution, so the
+// runProbeSweep checks the selected nodes concurrently. probeNodes guarantees
+// single-flight execution, so the
 // shared probeSweep* progress counters are never written by two sweeps at once.
-func (m *Manager) runProbeSweep(timeout time.Duration, activeOnly bool) {
+func (m *Manager) runProbeSweep(timeout time.Duration, since time.Time) {
 	if m.ctx.Err() != nil {
 		return
 	}
@@ -398,7 +402,7 @@ func (m *Manager) runProbeSweep(timeout time.Duration, activeOnly bool) {
 	logger := m.logger
 	entries := make([]*entry, 0, len(m.nodes))
 	for _, e := range m.nodes {
-		if !activeOnly || e.active.Load() > 0 {
+		if since.IsZero() || e.usedSince(since) {
 			entries = append(entries, e)
 		}
 	}
@@ -464,15 +468,15 @@ func (m *Manager) runProbeSweep(timeout time.Duration, activeOnly bool) {
 		go func(entry *entry, tag string) {
 			defer wg.Done()
 			defer func() { <-sem }()
-			if activeOnly && entry.active.Load() <= 0 {
+			if !since.IsZero() && !entry.usedSince(since) {
 				m.probeSweepDone.Add(1)
 				return
 			}
 
 			ctx, cancel := context.WithTimeout(m.ctx, timeout)
 			defer cancel()
-			if activeOnly {
-				ctx = context.WithValue(ctx, periodicProbeKey{}, true)
+			if !since.IsZero() {
+				ctx = context.WithValue(ctx, periodicProbeKey{}, since)
 			}
 
 			latency, err, authoritative, generation := entry.waitProbe(ctx)
@@ -548,6 +552,11 @@ func (m *Manager) Register(info NodeInfo) *EntryHandle {
 			info:     info,
 			timeline: make([]TimelineEvent, 0, maxTimelineSize),
 		}
+		if len(m.reloadMeasures) != 0 && info.URI != "" {
+			if measurements, ok := m.reloadMeasures[nodeIdentity(info)]; ok {
+				measurements.restore(e, time.Now())
+			}
+		}
 		m.nodes[info.Tag] = e
 	} else {
 		e.mu.Lock()
@@ -565,6 +574,32 @@ func (m *Manager) Register(info NodeInfo) *EntryHandle {
 		e.mu.Unlock()
 	}
 	return &EntryHandle{ref: e}
+}
+
+// BeginNodeReload passes valid measurements to matching nodes in the replacement
+// runtime. New entries keep old callbacks isolated and retain original probe times.
+func (m *Manager) BeginNodeReload() func() {
+	m.mu.Lock()
+	now := time.Now()
+	m.reloadMeasures = make(map[string]nodeMeasurements)
+	for _, e := range m.nodes {
+		e.mu.RLock()
+		if e.info.URI != "" && e.exitRouteReadyLocked(now) {
+			key := nodeIdentity(e.info)
+			m.reloadMeasures[key] = nodeMeasurements{
+				info: e.info, exitIP: e.exitIP, exitVerifiedAt: e.exitVerifiedAt,
+				lastProbe: e.lastProbe, lastProbeAt: e.lastProbeAt,
+			}
+		}
+		e.mu.RUnlock()
+	}
+	m.nodes = make(map[string]*entry)
+	m.mu.Unlock()
+	return func() {
+		m.mu.Lock()
+		m.reloadMeasures = nil
+		m.mu.Unlock()
+	}
 }
 
 // ClearNodes removes all registered nodes. Call before re-registering
@@ -896,10 +931,12 @@ func (e *entry) clearBlacklist() {
 }
 
 func (e *entry) incActive() {
+	e.lastUsedAt.Store(time.Now().UnixNano())
 	e.active.Add(1)
 }
 
 func (e *entry) decActive() {
+	e.lastUsedAt.Store(time.Now().UnixNano())
 	e.active.Add(-1)
 }
 
@@ -1117,8 +1154,12 @@ func (e *entry) exitRouteReadyLocked(now time.Time) bool {
 		!(e.blacklist && (e.until.IsZero() || now.Before(e.until)))
 }
 
-func (h *EntryHandle) Active() bool {
-	return h != nil && h.ref != nil && h.ref.active.Load() > 0
+func (e *entry) usedSince(since time.Time) bool {
+	return e.active.Load() > 0 || (!since.IsZero() && e.lastUsedAt.Load() >= since.UnixNano())
+}
+
+func (h *EntryHandle) UsedSince(since time.Time) bool {
+	return h != nil && h.ref != nil && h.ref.usedSince(since)
 }
 
 func (h *EntryHandle) EndExitLookup() {

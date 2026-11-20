@@ -1,13 +1,39 @@
 package monitor
 
 import (
+	"net/netip"
+	"time"
+
 	"easy_proxies/internal/config"
 	"easy_proxies/internal/ipmeta"
 )
 
 func sameNodeIdentity(a, b NodeInfo) bool {
-	oldNode, newNode := config.NodeConfig{URI: a.URI}, config.NodeConfig{URI: b.URI}
-	return oldNode.NodeKey() == newNode.NodeKey()
+	return nodeIdentity(a) == nodeIdentity(b)
+}
+
+func nodeIdentity(info NodeInfo) string {
+	node := config.NodeConfig{URI: info.URI}
+	return node.NodeKey()
+}
+
+type nodeMeasurements struct {
+	info           NodeInfo
+	exitIP         netip.Addr
+	exitVerifiedAt time.Time
+	lastProbe      time.Duration
+	lastProbeAt    time.Time
+}
+
+func (m nodeMeasurements) restore(e *entry, now time.Time) {
+	if now.Sub(m.exitVerifiedAt) >= exitRoutingTTL || now.Sub(m.lastProbeAt) >= exitRoutingTTL {
+		return
+	}
+	copyExitMetadata(&e.info, m.info)
+	formatNodeName(&e.info)
+	e.exitIP, e.exitVerifiedAt = m.exitIP, m.exitVerifiedAt
+	e.lastProbe, e.lastProbeAt, e.lastOK = m.lastProbe, m.lastProbeAt, m.lastProbeAt
+	e.initialCheckDone, e.available = true, true
 }
 
 // Only derived fields are copied. Listen addresses, ports, URI and original

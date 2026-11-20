@@ -102,6 +102,7 @@ type memberState struct {
 type poolOutbound struct {
 	outbound.Adapter
 	ctx            context.Context
+	cancel         context.CancelFunc
 	logger         singlog.ContextLogger
 	manager        adapter.OutboundManager
 	options        Options
@@ -131,9 +132,11 @@ func newPool(ctx context.Context, _ adapter.Router, logger singlog.ContextLogger
 	monitorMgr := monitor.FromContext(ctx)
 	normalized := normalizeOptions(options)
 	memberCount := len(normalized.Members)
+	ctx, cancel := context.WithCancel(ctx)
 	p := &poolOutbound{
 		Adapter: outbound.NewAdapter(Type, tag, []string{N.NetworkTCP, N.NetworkUDP}, normalized.Members),
 		ctx:     ctx,
+		cancel:  cancel,
 		logger:  logger,
 		manager: manager,
 		options: normalized,
@@ -1159,7 +1162,7 @@ func (p *poolOutbound) probeMember(ctx context.Context, member *memberState, des
 	if member.entry != nil {
 		member.entry.RecordSuccessWithLatency(duration)
 	}
-	p.scheduleExitLookup(member, monitor.IsPeriodicProbe(ctx))
+	p.scheduleExitLookup(member, monitor.PeriodicProbeSince(ctx))
 	// Clear a permanent pool blacklist on successful probe — a node that passes
 	// the health check should be available for selection immediately (fixes #8,
 	// #9). A live transient / rate-limit cooldown is deliberately preserved: the
@@ -1301,6 +1304,9 @@ func (p *poolOutbound) indexMembersLocked() {
 // Close releases the global registry reference without touching a replacement
 // pool or the manager-owned named-session store.
 func (p *poolOutbound) Close() error {
+	if p.cancel != nil {
+		p.cancel()
+	}
 	unregisterDialer(p.Tag(), p)
 	return nil
 }

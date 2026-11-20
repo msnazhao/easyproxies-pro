@@ -247,3 +247,26 @@ func TestSubscriptionsRequireSuccessfulHealthProbe(t *testing.T) {
 		})
 	}
 }
+
+func TestExitSubscriptionRetainsFreshMeasurementsAcrossReload(t *testing.T) {
+	s, _ := newProxySessionTestServer(t, proxySessionTestConfig())
+	info := NodeInfo{Tag: "original", Name: "Original", URI: "vless://fixture@upstream.example:443#original"}
+	old := registerHealthySubscriptionNode(s.mgr, info)
+	old.SetExit("8.8.8.8", "US", "", "", "")
+	verifiedAt := s.mgr.Snapshot()[0].ExitVerifiedAt
+
+	finish := s.mgr.BeginNodeReload()
+	defer finish()
+	info.Tag, info.Name, info.URI = "renamed", "Renamed", "vless://fixture@upstream.example:443#renamed"
+	newEntry := s.mgr.Register(info)
+	s.mgr.Register(NodeInfo{Tag: "different", URI: "vless://other@upstream.example:443"})
+	old.InvalidateExit()
+	if newEntry.ref == old.ref || !newEntry.ref.snapshot().ExitVerifiedAt.Equal(verifiedAt) {
+		t.Fatal("reload reused old callbacks or renewed an existing observation")
+	}
+	result := proxyAPIRequest(t, s, http.MethodGet, "/sub/proxies2?c=US", "")
+	if result.Code != http.StatusOK || !strings.Contains(result.Body.String(), "._ip_8.8.8.8") ||
+		!strings.Contains(result.Body.String(), "Renamed") {
+		t.Fatalf("valid exit disappeared or retained the old name after reload: status=%d", result.Code)
+	}
+}

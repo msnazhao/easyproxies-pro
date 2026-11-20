@@ -284,9 +284,15 @@ func (m *Manager) reloadLocked(newCfg *config.Config) error {
 	// Reset shared state store to ensure clean state for new config
 	pool.ResetSharedStateStore()
 
-	// Clear stale monitor nodes so the dashboard reflects the new config
+	// Register the replacement nodes with any still-valid measurements for the
+	// same connection identity and probe settings.
 	if m.monitorMgr != nil {
-		m.monitorMgr.ClearNodes()
+		if oldCfg.Management.ProbeTarget == newCfg.Management.ProbeTarget && oldCfg.SkipCertVerify == newCfg.SkipCertVerify {
+			finishReload := m.monitorMgr.BeginNodeReload()
+			defer finishReload()
+		} else {
+			m.monitorMgr.ClearNodes()
+		}
 	}
 
 	// Create and start new box instance.

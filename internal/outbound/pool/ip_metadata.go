@@ -22,13 +22,13 @@ import (
 
 var errExitProbeMismatch = errors.New("exit probes disagree")
 
-func (p *poolOutbound) scheduleExitLookup(member *memberState, activeOnly bool) {
+func (p *poolOutbound) scheduleExitLookup(member *memberState, since time.Time) {
 	entry := member.entry
-	if activeOnly && !entry.Active() {
+	if p.ctx.Err() != nil || (!since.IsZero() && !entry.UsedSince(since)) {
 		return
 	}
 	if !entry.BeginExitLookup() {
-		if entry.Active() && p.monitor != nil {
+		if entry.UsedSince(since) && p.monitor != nil {
 			p.monitor.RefreshExitMetadata(p.ctx, entry)
 		}
 		return
@@ -41,7 +41,7 @@ func (p *poolOutbound) scheduleExitLookup(member *memberState, activeOnly bool) 
 		case <-p.ctx.Done():
 			return
 		}
-		if p.ctx.Err() != nil || (activeOnly && !entry.Active()) {
+		if p.ctx.Err() != nil || (!since.IsZero() && !entry.UsedSince(since)) {
 			return
 		}
 		location, err := p.lookupExit(member)
@@ -51,7 +51,7 @@ func (p *poolOutbound) scheduleExitLookup(member *memberState, activeOnly bool) 
 		if err == nil {
 			entry.SetExit(location.IP, location.ISO, location.Country, geoip.RegionForISO(location.ISO), location.Org)
 			if p.monitor != nil {
-				if entry.Active() {
+				if entry.UsedSince(since) {
 					p.monitor.RefreshExitMetadata(p.ctx, entry)
 				} else {
 					p.monitor.EnrichExit(p.ctx, entry, false)

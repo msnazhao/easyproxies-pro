@@ -65,13 +65,18 @@ func TestExitRouteRequiresRecentHealthAndExitConfirmation(t *testing.T) {
 	}
 }
 
-func TestPeriodicHealthSweepOnlyProbesActiveNodes(t *testing.T) {
+func TestPeriodicHealthSweepOnlyProbesNodesInUse(t *testing.T) {
 	m, _ := NewManager(Config{})
 	defer m.Stop()
-	var activeCalls, idleCalls int
+	var activeCalls, recentCalls, idleCalls int
 	active := m.Register(NodeInfo{Tag: "active"})
 	active.SetProbe(func(context.Context) (time.Duration, error) {
 		activeCalls++
+		return time.Millisecond, nil
+	})
+	recent := m.Register(NodeInfo{Tag: "recent"})
+	recent.SetProbe(func(context.Context) (time.Duration, error) {
+		recentCalls++
 		return time.Millisecond, nil
 	})
 	idle := m.Register(NodeInfo{Tag: "idle"})
@@ -80,13 +85,16 @@ func TestPeriodicHealthSweepOnlyProbesActiveNodes(t *testing.T) {
 		return time.Millisecond, nil
 	})
 	active.IncActive()
-	m.probeNodes(time.Second, true)
-	if activeCalls != 1 || idleCalls != 0 {
-		t.Fatalf("periodic sweep called active=%d, idle=%d", activeCalls, idleCalls)
+	recent.IncActive()
+	recent.DecActive()
+	idle.ref.lastUsedAt.Store(time.Now().Add(-time.Hour).UnixNano())
+	m.probeNodes(time.Second, time.Now().Add(-5*time.Minute))
+	if activeCalls != 1 || recentCalls != 1 || idleCalls != 0 {
+		t.Fatalf("periodic sweep called active=%d, recent=%d, idle=%d", activeCalls, recentCalls, idleCalls)
 	}
 	active.DecActive()
 	m.ProbeAllNow(time.Second)
-	if activeCalls != 2 || idleCalls != 1 {
-		t.Fatalf("full sweep called active=%d, idle=%d", activeCalls, idleCalls)
+	if activeCalls != 2 || recentCalls != 2 || idleCalls != 1 {
+		t.Fatalf("full sweep called active=%d, recent=%d, idle=%d", activeCalls, recentCalls, idleCalls)
 	}
 }
