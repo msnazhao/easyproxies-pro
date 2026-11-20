@@ -5,6 +5,14 @@ import (
 	"strings"
 )
 
+// ExitSessionName generates the canonical suffix, or an empty string for an invalid exit.
+func ExitSessionName(ip netip.Addr) string {
+	if !isSessionExit(ip) {
+		return ""
+	}
+	return "_ip_" + strings.ReplaceAll(ip.Unmap().String(), ":", "-")
+}
+
 // ParseExitSession parses a reserved exit IP suffix. A reserved but malformed
 // suffix yields an invalid address, so callers can reject it during auth.
 func ParseExitSession(name string) (netip.Addr, bool) {
@@ -17,12 +25,15 @@ func ParseExitSession(name string) (netip.Addr, bool) {
 		return netip.Addr{}, true
 	}
 	ip, err := netip.ParseAddr(strings.ReplaceAll(address, "-", ":"))
-	if err != nil || ip.Zone() != "" {
+	if err != nil {
 		return netip.Addr{}, true
 	}
-	ip = ip.Unmap()
-	if !ip.IsGlobalUnicast() || ip.IsPrivate() {
+	if !isSessionExit(ip) {
 		return netip.Addr{}, true
 	}
-	return ip, true
+	return ip.Unmap(), true
+}
+
+func isSessionExit(ip netip.Addr) bool {
+	return ip.Zone() == "" && ip.IsGlobalUnicast() && !ip.IsPrivate()
 }

@@ -5,11 +5,20 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"strings"
 	"testing"
+	"time"
 
 	"easy_proxies/internal/config"
 )
+
+func registerHealthySubscriptionNode(m *Manager, node NodeInfo) *EntryHandle {
+	entry := m.Register(node)
+	entry.RecordSuccessWithLatency(time.Millisecond)
+	entry.MarkInitialCheckDone(true)
+	return entry
+}
 
 func TestProxySubscriptionMultipleCountriesAndTypes(t *testing.T) {
 	s, _ := newProxySessionTestServer(t, proxySessionTestConfig())
@@ -20,7 +29,7 @@ func TestProxySubscriptionMultipleCountriesAndTypes(t *testing.T) {
 		{Tag: "ss-tr", URI: "ss://tr", CountryCode: "TR", ExitIP: "8.8.4.4"},
 		{Tag: "hy2-gb", URI: "hy2://gb", CountryCode: "GB", ExitIP: "1.0.0.1"},
 	} {
-		s.mgr.Register(node).MarkInitialCheckDone(true)
+		registerHealthySubscriptionNode(s.mgr, node)
 	}
 	for _, query := range []string{"c=us,gb&t=ss,vless", "c=us&c=gb&t=ss&t=vless"} {
 		r := proxyAPIRequest(t, s, http.MethodGet, "/sub/proxies?"+query, "")
@@ -42,8 +51,8 @@ func TestProxySubscriptionFiltersMeasuredExitWithoutAuth(t *testing.T) {
 	cfg := proxySessionTestConfig()
 	cfg.Management = config.ManagementConfig{Password: "secret"}
 	s, _ := newProxySessionTestServer(t, cfg)
-	s.mgr.Register(NodeInfo{Tag: "us", URI: "vless://u@host:443", CountryCode: "US", ExitIP: "8.8.8.8"}).MarkInitialCheckDone(true)
-	s.mgr.Register(NodeInfo{Tag: "server-only", URI: "trojan://p@host:443", EntryISO: "US"}).MarkInitialCheckDone(true)
+	registerHealthySubscriptionNode(s.mgr, NodeInfo{Tag: "us", URI: "vless://u@host:443", CountryCode: "US", ExitIP: "8.8.8.8"})
+	registerHealthySubscriptionNode(s.mgr, NodeInfo{Tag: "server-only", URI: "trojan://p@host:443", EntryISO: "US"})
 	s.mgr.Register(NodeInfo{Tag: "dead", URI: "ss://x@host:443", CountryCode: "US", ExitIP: "1.1.1.1"}).MarkInitialCheckDone(false)
 	if r := proxyAPIRequest(t, s, http.MethodGet, "/sub/proxies?c=US", ""); r.Code != http.StatusOK {
 		t.Fatalf("public subscription status = %d", r.Code)
@@ -99,12 +108,165 @@ func TestProxySubscriptionFiltersMeasuredExitWithoutAuth(t *testing.T) {
 func TestProxySubscriptionRejectsUnsupportedExports(t *testing.T) {
 	cfg := proxySessionTestConfig()
 	s, _ := newProxySessionTestServer(t, cfg)
-	s.mgr.Register(NodeInfo{Tag: "unknown", URI: "unknown://proxy", ExitIP: "8.8.8.8", CountryCode: "US"}).MarkInitialCheckDone(true)
+	registerHealthySubscriptionNode(s.mgr, NodeInfo{Tag: "unknown", URI: "unknown://proxy", ExitIP: "8.8.8.8", CountryCode: "US"})
 	s.SetOutboundConverter(func(string, string, bool) ([]byte, error) { return nil, nil })
 	for _, path := range []string{"/sub/proxies?c=US", "/sub/proxies?c=US&f=sing-box"} {
 		r := proxyAPIRequest(t, s, http.MethodGet, path, "")
 		if r.Code != http.StatusServiceUnavailable {
 			t.Fatalf("%s: status = %d, body = %s", path, r.Code, r.Body)
+		}
+	}
+}
+
+func TestExitProxySubscriptionSOCKS5(t *testing.T) {
+	cfg := proxySessionTestConfig()
+	cfg.ExternalIP = "relay.example"
+	cfg.Listener.Password = "password:@#"
+	s, store := newProxySessionTestServer(t, cfg)
+	for _, node := range []NodeInfo{
+		{Tag: "a", Name: "美国 A", URI: "vless://upstream-secret@a:443", CountryCode: "US", NetworkType: "isp", ExitIP: "8.8.8.8"},
+		{Tag: "b", Name: "美国 B #1", URI: "ss://upstream-secret@b:443", CountryCode: "US", NetworkType: "mobile", ExitIP: "::ffff:8.8.8.8"},
+		{Tag: "c", Name: "英国 IPv6", URI: "hy2://upstream-secret@c:443", CountryCode: "GB", NetworkType: "isp", ExitIP: "2606:4700:0:0:0:0:0:1111"},
+		{Tag: "hosting", Name: "Hosting", URI: "vless://u@d:443", CountryCode: "US", NetworkType: "hosting", ExitIP: "8.8.4.4"},
+		{Tag: "country", Name: "Country", URI: "vless://u@e:443", CountryCode: "JP", NetworkType: "isp", ExitIP: "1.1.1.1"},
+		{Tag: "protocol", Name: "Protocol", URI: "trojan://u@f:443", CountryCode: "US", NetworkType: "isp", ExitIP: "1.0.0.1"},
+		{Tag: "unknown", Name: "Unknown exit", URI: "vmess://u@g:443", NetworkType: "isp"},
+		{Tag: "offline", Name: "Offline", URI: "vless://u@h:443", CountryCode: "US", NetworkType: "isp", ExitIP: "8.8.8.8"},
+		{Tag: "stale-exit", Name: "Stale exit", URI: "vless://u@i:443", CountryCode: "US", NetworkType: "isp", ExitIP: "9.9.9.9"},
+		{Tag: "stale-probe", Name: "Stale health probe", URI: "vless://u@j:443", CountryCode: "US", NetworkType: "isp", ExitIP: "149.112.112.112"},
+	} {
+		entry := registerHealthySubscriptionNode(s.mgr, node)
+		entry.SetExit(node.ExitIP, node.CountryCode, "", "", "")
+		entry.ref.mu.Lock()
+		entry.ref.info.NetworkType = node.NetworkType
+		entry.ref.info.Name = node.Name
+		switch node.Tag {
+		case "stale-exit":
+			entry.ref.exitVerifiedAt = time.Now().Add(-exitRoutingTTL)
+		case "stale-probe":
+			entry.ref.lastProbeAt = time.Now().Add(-exitRoutingTTL)
+		}
+		entry.ref.mu.Unlock()
+		entry.MarkInitialCheckDone(node.Tag != "offline")
+		switch node.Tag {
+		case "a":
+			entry.RecordSuccessWithLatency(1900 * time.Microsecond)
+		case "b":
+			entry.RecordSuccessWithLatency(1100 * time.Microsecond)
+		case "offline":
+			entry.RecordSuccessWithLatency(time.Microsecond)
+		}
+	}
+	path := "/sub/proxies2?c=us,gb&t=vless,ss,hysteria2&n=isp&f=socks5"
+	req := httptest.NewRequest(http.MethodGet, "http://dashboard.example:9091"+path, nil)
+	req.SetBasicAuth(cfg.Listener.Username, cfg.Listener.Password)
+	w := httptest.NewRecorder()
+	s.srv.Handler.ServeHTTP(w, req)
+	if w.Code != http.StatusOK || w.Header().Get("Cache-Control") != "no-store" {
+		t.Fatalf("status=%d headers=%v", w.Code, w.Header())
+	}
+	want := map[string]string{
+		"美国 B #1": "wang._ip_8.8.8.8",
+		"英国 IPv6": "wang._ip_2606-4700--1111",
+	}
+	for _, line := range strings.Split(strings.TrimSpace(w.Body.String()), "\n") {
+		link, err := url.Parse(line)
+		if err != nil || link.Scheme != "socks5" || link.Host != "relay.example:2323" || link.User == nil {
+			t.Fatal("subscription contains an invalid SOCKS5 link")
+		}
+		password, _ := link.User.Password()
+		if want[link.Fragment] != link.User.Username() || password != cfg.Listener.Password {
+			t.Fatalf("wrong credentials or display name: %q", link.Fragment)
+		}
+		delete(want, link.Fragment)
+	}
+	if len(want) != 0 || len(store.List()) != 0 || strings.Contains(w.Body.String(), "upstream-secret") {
+		t.Fatal("subscription omitted nodes, created bindings, or exposed upstream credentials")
+	}
+
+	// Protocol filtering can match a node that has no IP for the generated session.
+	unknown := httptest.NewRequest(http.MethodGet, "/sub/proxies2?t=vmess", nil)
+	unknown.SetBasicAuth(cfg.Listener.Username, cfg.Listener.Password)
+	w = httptest.NewRecorder()
+	s.srv.Handler.ServeHTTP(w, unknown)
+	if w.Code != http.StatusServiceUnavailable {
+		t.Fatalf("no matching exits returned %d", w.Code)
+	}
+}
+
+func TestSubscriptionsRequireSuccessfulHealthProbe(t *testing.T) {
+	cfg := proxySessionTestConfig()
+	s, _ := newProxySessionTestServer(t, cfg)
+	for tag, ip := range map[string]string{
+		"healthy": "8.8.8.8", "unchecked": "8.8.4.4", "failed": "9.9.9.9",
+		"blacklisted": "1.1.1.1", "unprobed": "1.0.0.1",
+	} {
+		entry := s.mgr.Register(NodeInfo{Tag: tag, Name: tag, URI: "vless://fixture@" + tag + ".example:443"})
+		entry.SetExit(ip, "US", "", "", "")
+		switch tag {
+		case "healthy", "blacklisted":
+			entry.RecordSuccessWithLatency(time.Millisecond)
+			entry.MarkInitialCheckDone(true)
+		case "failed":
+			entry.RecordSuccessWithLatency(2 * time.Millisecond)
+			entry.MarkInitialCheckDone(false)
+		case "unprobed":
+			// Matches the scheduler's optimistic state when a probe is unavailable.
+			entry.MarkInitialCheckDone(true)
+		}
+		if tag == "blacklisted" {
+			entry.Blacklist(time.Now().Add(time.Hour))
+		}
+	}
+	s.SetOutboundConverter(func(tag, uri string, _ bool) ([]byte, error) {
+		return json.Marshal(map[string]string{"tag": tag, "uri": uri})
+	})
+	for _, path := range []string{"/sub/proxies", "/sub/proxies?f=sing-box", "/sub/proxies2"} {
+		t.Run(path, func(t *testing.T) {
+			req := httptest.NewRequest(http.MethodGet, path, nil)
+			req.SetBasicAuth(cfg.Listener.Username, cfg.Listener.Password)
+			w := httptest.NewRecorder()
+			s.srv.Handler.ServeHTTP(w, req)
+			if w.Code != http.StatusOK {
+				t.Fatalf("status = %d", w.Code)
+			}
+			body := w.Body.String()
+			if path == "/sub/proxies" {
+				decoded, err := base64.StdEncoding.DecodeString(body)
+				if err != nil {
+					t.Fatal(err)
+				}
+				body = string(decoded)
+			}
+			if !strings.Contains(body, "healthy") {
+				t.Fatal("healthy node was missing")
+			}
+			for _, tag := range []string{"unchecked", "failed", "blacklisted", "unprobed"} {
+				if strings.Contains(body, tag) {
+					t.Fatalf("included %s node", tag)
+				}
+			}
+		})
+	}
+}
+
+func TestExitProxySubscriptionRequiresListenerCredentials(t *testing.T) {
+	cfg := proxySessionTestConfig()
+	s, _ := newProxySessionTestServer(t, cfg)
+	for _, credentials := range []struct{ user, password string }{
+		{},
+		{cfg.Listener.Username + "._ip_8.8.8.8", cfg.Listener.Password},
+		{"wrong", cfg.Listener.Password},
+		{cfg.Listener.Username, "wrong"},
+	} {
+		req := httptest.NewRequest(http.MethodGet, "/sub/proxies2", nil)
+		if credentials.user != "" {
+			req.SetBasicAuth(credentials.user, credentials.password)
+		}
+		w := httptest.NewRecorder()
+		s.srv.Handler.ServeHTTP(w, req)
+		if w.Code != http.StatusUnauthorized || w.Header().Get("WWW-Authenticate") == "" {
+			t.Fatalf("unauthorized request returned %d", w.Code)
 		}
 	}
 }

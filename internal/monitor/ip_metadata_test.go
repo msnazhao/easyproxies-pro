@@ -74,7 +74,7 @@ func TestMetadataAuthorityHostingUsageAndReloadCache(t *testing.T) {
 func TestSubscriptionNetworkFilterAndRenamedLinks(t *testing.T) {
 	s, _ := newProxySessionTestServer(t, proxySessionTestConfig())
 	for _, network := range []string{"isp", "mobile", "hosting", ""} {
-		s.mgr.Register(NodeInfo{Tag: network + "-node", Name: "ISP|0|GB|1.1.1.1|Org|Original", URI: "vless://uuid@" + network + "proxy:443#old", NetworkType: network, CountryCode: "GB", ExitIP: "1.1.1.1"}).MarkInitialCheckDone(true)
+		registerHealthySubscriptionNode(s.mgr, NodeInfo{Tag: network + "-node", Name: "ISP|0|GB|1.1.1.1|Org|Original", URI: "vless://uuid@" + network + "proxy:443#old", NetworkType: network, CountryCode: "GB", ExitIP: "1.1.1.1"})
 	}
 	r := proxyAPIRequest(t, s, http.MethodGet, "/sub/proxies?n=isp&c=GB", "")
 	body, err := base64.StdEncoding.DecodeString(r.Body.String())
@@ -142,6 +142,7 @@ func TestISPSubscriptionScoreAndOtherExclusions(t *testing.T) {
 			s.mgr.Metadata.Configure(ipmeta.Config{AbuseKeys: []string{"fixture-key"}})
 			h := s.mgr.Register(NodeInfo{Tag: tc.name, Name: "Original", URI: "vless://uuid@fixture.example:443#Original", ExitIP: "1.1.1.1", CountryCode: "GB", Provider: "Example Network"})
 			if !tc.unchecked {
+				h.RecordSuccessWithLatency(time.Millisecond)
 				h.MarkInitialCheckDone(!tc.unavailable)
 			}
 			if tc.blacklisted {
@@ -191,7 +192,7 @@ func TestISPSubscriptionReportedSSURI(t *testing.T) {
 	for _, score := range []int{0, 58, 100} {
 		s, _ := newProxySessionTestServer(t, proxySessionTestConfig())
 		name := ipmeta.DisplayName(original.Fragment, "KR", original.Server, "Example ISP", "example.com", "isp", &score)
-		s.mgr.Register(NodeInfo{Tag: "reported", Name: name, URI: uri, ExitIP: original.Server, CountryCode: "KR", NetworkType: "isp", Abuse: &ipmeta.Abuse{Score: &score, Usage: "Fixed Line ISP"}}).MarkInitialCheckDone(true)
+		registerHealthySubscriptionNode(s.mgr, NodeInfo{Tag: "reported", Name: name, URI: uri, ExitIP: original.Server, CountryCode: "KR", NetworkType: "isp", Abuse: &ipmeta.Abuse{Score: &score, Usage: "Fixed Line ISP"}})
 		r := proxyAPIRequest(t, s, http.MethodGet, "/sub/proxies?n=isp&t=ss&c=KR", "")
 		if r.Code != 200 {
 			t.Fatalf("score %d: export status %d", score, r.Code)

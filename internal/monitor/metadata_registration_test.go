@@ -17,8 +17,7 @@ import (
 func TestRegistrationPreservesMeasuredISPForSameIdentity(t *testing.T) {
 	s, _ := newProxySessionTestServer(t, proxySessionTestConfig())
 	meta := NodeInfo{Tag: "kr", Name: "Original", URI: "ss://aes-256-cfb:fixture@211.178.105.134:6123#Original", Port: 24000}
-	h := s.mgr.Register(meta)
-	h.MarkInitialCheckDone(true)
+	h := registerHealthySubscriptionNode(s.mgr, meta)
 	score := 58
 	h.ref.mu.Lock()
 	h.ref.info.ExitIP = "211.178.105.1"
@@ -98,7 +97,7 @@ func TestMetadataCompletionKeepsConcurrentStaticChanges(t *testing.T) {
 
 func TestISPNameCannotBypassNetworkFilter(t *testing.T) {
 	s, _ := newProxySessionTestServer(t, proxySessionTestConfig())
-	s.mgr.Register(NodeInfo{Tag: "fake", Name: "ISP|0|KR|fake", URI: "trojan://fixture@host.example:443", NetworkType: "hosting", ExitIP: "1.1.1.1", CountryCode: "KR"}).MarkInitialCheckDone(true)
+	registerHealthySubscriptionNode(s.mgr, NodeInfo{Tag: "fake", Name: "ISP|0|KR|fake", URI: "trojan://fixture@host.example:443", NetworkType: "hosting", ExitIP: "1.1.1.1", CountryCode: "KR"})
 	if r := proxyAPIRequest(t, s, http.MethodGet, "/sub/proxies?n=isp", ""); r.Code != 503 {
 		t.Fatal("untrusted display name bypassed type filter")
 	}
@@ -167,8 +166,7 @@ func TestISPClassificationPendingThenNonzeroScoreExports(t *testing.T) {
 	s, _ := newProxySessionTestServer(t, proxySessionTestConfig())
 	s.mgr.Metadata.AbuseURL = api.URL
 	s.mgr.Metadata.Configure(ipmeta.Config{AbuseKeys: []string{"fixture"}})
-	h := s.mgr.Register(NodeInfo{Tag: "a", Name: "Original", URI: "trojan://fixture@host.example:443", ExitIP: "1.1.1.1", CountryCode: "KR", Provider: "Example ISP"})
-	h.MarkInitialCheckDone(true)
+	h := registerHealthySubscriptionNode(s.mgr, NodeInfo{Tag: "a", Name: "Original", URI: "trojan://fixture@host.example:443", ExitIP: "1.1.1.1", CountryCode: "KR", Provider: "Example ISP"})
 	s.mgr.EnrichExit(context.Background(), h, false)
 	<-started
 	if r := proxyAPIRequest(t, s, http.MethodGet, "/sub/proxies", ""); r.Code != 200 {

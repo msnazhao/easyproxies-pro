@@ -80,6 +80,7 @@ type Snapshot struct {
 	Available         bool            `json:"available"`
 	InitialCheckDone  bool            `json:"initial_check_done"`
 	Timeline          []TimelineEvent `json:"timeline,omitempty"`
+	exitRouteIP       netip.Addr
 }
 
 type probeFunc func(ctx context.Context) (time.Duration, error)
@@ -792,6 +793,11 @@ func (e *entry) snapshot() Snapshot {
 	e.mu.RLock()
 	defer e.mu.RUnlock()
 
+	now := time.Now()
+	var exitRouteIP netip.Addr
+	if e.exitRouteReadyLocked(now) {
+		exitRouteIP = e.exitIP
+	}
 	latencyMs := int64(-1)
 	if e.lastProbe > 0 {
 		latencyMs = e.lastProbe.Milliseconds()
@@ -810,7 +816,7 @@ func (e *entry) snapshot() Snapshot {
 		NodeInfo:          e.info,
 		FailureCount:      e.failure,
 		SuccessCount:      e.success,
-		Blacklisted:       e.blacklist && (e.until.IsZero() || time.Now().Before(e.until)),
+		Blacklisted:       e.blacklist && (e.until.IsZero() || now.Before(e.until)),
 		BlacklistedUntil:  e.until,
 		ActiveConnections: e.active.Load(),
 		LastError:         e.lastError,
@@ -822,6 +828,7 @@ func (e *entry) snapshot() Snapshot {
 		Available:         e.available,
 		InitialCheckDone:  e.initialCheckDone,
 		Timeline:          timelineCopy,
+		exitRouteIP:       exitRouteIP,
 	}
 }
 
@@ -1098,12 +1105,16 @@ func (h *EntryHandle) ExitRouteLatency(ip netip.Addr, now time.Time) time.Durati
 	e := h.ref
 	e.mu.RLock()
 	defer e.mu.RUnlock()
-	if e.exitIP != ip || now.Sub(e.exitVerifiedAt) >= exitRoutingTTL ||
-		now.Sub(e.lastProbeAt) >= exitRoutingTTL || !e.initialCheckDone || !e.available ||
-		e.blacklist && (e.until.IsZero() || now.Before(e.until)) {
+	if e.exitIP != ip || !e.exitRouteReadyLocked(now) {
 		return 0
 	}
 	return e.lastProbe
+}
+
+func (e *entry) exitRouteReadyLocked(now time.Time) bool {
+	return e.exitIP.IsValid() && e.lastProbe > 0 && e.initialCheckDone && e.available &&
+		now.Sub(e.exitVerifiedAt) < exitRoutingTTL && now.Sub(e.lastProbeAt) < exitRoutingTTL &&
+		!(e.blacklist && (e.until.IsZero() || now.Before(e.until)))
 }
 
 func (h *EntryHandle) Active() bool {

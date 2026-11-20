@@ -4,18 +4,51 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"net"
 	"net/http"
+	"net/url"
+	"strconv"
 	"strings"
+	"time"
+
+	"easy_proxies/internal/routing"
 )
 
 // handleProxySubscription is public so subscription clients need no login.
 func (s *Server) handleProxySubscription(w http.ResponseWriter, r *http.Request) {
+	s.writeProxySubscription(w, r, false)
+}
+
+func (s *Server) handleExitProxySubscription(w http.ResponseWriter, r *http.Request) {
+	s.writeProxySubscription(w, r, true)
+}
+
+func (s *Server) writeProxySubscription(w http.ResponseWriter, r *http.Request, byExitIP bool) {
 	w.Header().Set("Cache-Control", "no-store")
 	w.Header().Set("X-Content-Type-Options", "nosniff")
 	if r.Method != http.MethodGet {
 		w.Header().Set("Allow", "GET")
 		http.Error(w, "GET required", http.StatusMethodNotAllowed)
 		return
+	}
+	var exitProxy url.URL
+	if byExitIP {
+		cfg, _ := s.proxyRoutingSnapshot()
+		if enabled, _ := proxySessionAvailability(cfg); !enabled || cfg.Listener.Port == 0 {
+			http.Error(w, "exit IP sessions unavailable", http.StatusServiceUnavailable)
+			return
+		}
+		user, password, ok := r.BasicAuth()
+		if _, authorized := routing.VerifyProxyCredentials(cfg.Listener.Username, cfg.Listener.Password, user, password, false); !ok || !authorized {
+			w.Header().Set("WWW-Authenticate", `Basic realm="Proxy subscription"`)
+			http.Error(w, "proxy listener credentials required", http.StatusUnauthorized)
+			return
+		}
+		exitProxy = url.URL{
+			Scheme: "socks5",
+			Host:   net.JoinHostPort(proxyLinkHost(cfg.ExternalIP, r), strconv.Itoa(int(cfg.Listener.Port))),
+			User:   url.UserPassword(cfg.Listener.Username, cfg.Listener.Password),
+		}
 	}
 	s.cfgMu.RLock()
 	converter := s.outboundConverter
@@ -51,17 +84,27 @@ func (s *Server) handleProxySubscription(w http.ResponseWriter, r *http.Request)
 		http.Error(w, "n must be isp, mobile, hosting or unknown", http.StatusBadRequest)
 		return
 	}
-	if format == "" {
-		format = "v2ray"
-	}
-	if format != "v2ray" && format != "sing-box" {
-		http.Error(w, "f must be v2ray or sing-box", http.StatusBadRequest)
-		return
+	if byExitIP {
+		if format != "" && format != "socks5" {
+			http.Error(w, "f must be socks5", http.StatusBadRequest)
+			return
+		}
+	} else {
+		if format == "" {
+			format = "v2ray"
+		}
+		if format != "v2ray" && format != "sing-box" {
+			http.Error(w, "f must be v2ray or sing-box", http.StatusBadRequest)
+			return
+		}
 	}
 	// Never infer a country from the server's location: only measured exits
 	// qualify for a country-specific subscription.
 	var nodes []Snapshot
 	for _, node := range s.mgr.SnapshotFiltered(true) {
+		if node.LastProbeLatency <= 0 || (byExitIP && !node.exitRouteIP.IsValid()) {
+			continue
+		}
 		if network != "" && node.NetworkType != network && !(network == "isp" && node.NetworkType == "mobile") && !(network == "unknown" && node.NetworkType == "") {
 			continue
 		}
@@ -72,6 +115,10 @@ func (s *Server) handleProxySubscription(w http.ResponseWriter, r *http.Request)
 		if (len(countries) == 0 || node.ExitIP != "" && countries[node.CountryCode]) && (len(types) == 0 || types[protocol]) {
 			nodes = append(nodes, node)
 		}
+	}
+	if byExitIP {
+		writeExitProxyLinks(w, exitProxy, nodes)
+		return
 	}
 	if len(nodes) == 0 {
 		http.Error(w, "no tested proxies available for this country", http.StatusServiceUnavailable)
@@ -127,4 +174,51 @@ func (s *Server) handleProxySubscription(w http.ResponseWriter, r *http.Request)
 	result["outbounds"] = append(outbounds, selector)
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
 	_ = json.NewEncoder(w).Encode(result)
+}
+
+func writeExitProxyLinks(w http.ResponseWriter, proxy url.URL, nodes []Snapshot) {
+	username := proxy.User.Username()
+	password, _ := proxy.User.Password()
+	if len(password) > 255 {
+		http.Error(w, "proxy password exceeds the SOCKS5 limit", http.StatusServiceUnavailable)
+		return
+	}
+	links := make([]string, 0, len(nodes))
+	type selectedExit struct {
+		linkIndex int
+		latency   time.Duration
+	}
+	selected := make(map[string]selectedExit, len(nodes))
+	for _, node := range nodes {
+		session := routing.ExitSessionName(node.exitRouteIP)
+		if session == "" {
+			continue
+		}
+		user := username + "." + session
+		if len(user) > 255 {
+			continue
+		}
+		previous, exists := selected[session]
+		latency := node.LastProbeLatency
+		// Use the full probe resolution when selecting a display name.
+		if exists && previous.latency <= latency {
+			continue
+		}
+		proxy.User = url.UserPassword(user, password)
+		proxy.Fragment = node.Name
+		if exists {
+			links[previous.linkIndex] = proxy.String()
+		} else {
+			previous.linkIndex = len(links)
+			links = append(links, proxy.String())
+		}
+		previous.latency = latency
+		selected[session] = previous
+	}
+	if len(links) == 0 {
+		http.Error(w, "no matching verified exit IP proxies available", http.StatusServiceUnavailable)
+		return
+	}
+	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+	_, _ = fmt.Fprintln(w, strings.Join(links, "\n"))
 }
