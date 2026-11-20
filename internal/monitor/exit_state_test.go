@@ -2,6 +2,7 @@ package monitor
 
 import (
 	"context"
+	"easy_proxies/internal/ipmeta"
 	"net/netip"
 	"testing"
 	"time"
@@ -11,12 +12,14 @@ func TestExitLookupRunsOnceUntilReload(t *testing.T) {
 	m, _ := NewManager(Config{})
 	defer m.Stop()
 	h := m.Register(NodeInfo{Tag: "a", EntryISO: "JP", EntryCountry: "Japan", Region: "other"})
-	if !h.BeginExitLookup() || h.BeginExitLookup() {
+	h.MarkInitialCheckDone(true)
+	h.RecordSuccessWithLatency(time.Millisecond)
+	if !h.BeginExitLookup(false) || h.BeginExitLookup(false) {
 		t.Fatal("concurrent lookups were not coalesced")
 	}
-	h.SetExit("8.8.8.8", "US", "United States", "us", "Example ISP")
-	h.EndExitLookup()
-	if h.BeginExitLookup() {
+	h.SetExit(ipmeta.Location{IP: "8.8.8.8", ISO: "US", Country: "United States", Org: "Example ISP"})
+	h.EndExitLookup("")
+	if h.BeginExitLookup(true) {
 		t.Fatal("confirmed exit was looked up again")
 	}
 	snap := m.Snapshot()[0]
@@ -24,8 +27,11 @@ func TestExitLookupRunsOnceUntilReload(t *testing.T) {
 		t.Fatalf("entry/exit location not preserved: %+v", snap.NodeInfo)
 	}
 	m.ClearNodes()
-	if !m.Register(NodeInfo{Tag: "a"}).BeginExitLookup() {
-		t.Fatal("reload should schedule a new exit lookup")
+	h = m.Register(NodeInfo{Tag: "a"})
+	h.MarkInitialCheckDone(true)
+	h.RecordSuccessWithLatency(time.Millisecond)
+	if !h.BeginExitLookup(false) {
+		t.Fatal("healthy node with cleared measurements could not start a lookup")
 	}
 }
 
@@ -34,7 +40,7 @@ func TestExitRouteRequiresRecentHealthAndExitConfirmation(t *testing.T) {
 	defer m.Stop()
 	h := m.Register(NodeInfo{Tag: "a", Name: "Original"})
 	ip := netip.MustParseAddr("8.8.8.8")
-	h.SetExit(ip.String(), "US", "", "", "")
+	h.SetExit(ipmeta.Location{IP: ip.String(), ISO: "US"})
 	h.MarkInitialCheckDone(true)
 	h.RecordSuccessWithLatency(time.Millisecond)
 	if h.ExitRouteLatency(ip, time.Now()) == 0 {
@@ -51,11 +57,11 @@ func TestExitRouteRequiresRecentHealthAndExitConfirmation(t *testing.T) {
 	h.ref.mu.Lock()
 	h.ref.exitVerifiedAt = time.Now().Add(-exitRoutingTTL)
 	h.ref.mu.Unlock()
-	if h.ExitRouteLatency(ip, time.Now()) != 0 || !h.BeginExitLookup() {
+	if h.ExitRouteLatency(ip, time.Now()) != 0 || !h.BeginExitLookup(true) {
 		t.Fatal("expired exit was eligible or could not be refreshed")
 	}
-	h.SetExit("1.1.1.1", "AU", "", "", "")
-	h.EndExitLookup()
+	h.SetExit(ipmeta.Location{IP: "1.1.1.1", ISO: "AU"})
+	h.EndExitLookup("")
 	if got := m.Snapshot()[0]; got.OriginalName != "Original" || got.ExitIP != "1.1.1.1" {
 		t.Fatalf("IP refresh changed identity or failed to publish new address: %+v", got)
 	}
@@ -96,5 +102,69 @@ func TestPeriodicHealthSweepOnlyProbesNodesInUse(t *testing.T) {
 	m.ProbeAllNow(time.Second)
 	if activeCalls != 2 || recentCalls != 2 || idleCalls != 1 {
 		t.Fatalf("full sweep called active=%d, recent=%d, idle=%d", activeCalls, recentCalls, idleCalls)
+	}
+}
+
+func TestUnknownExitRetriesOnlyAfterTrafficAndCooldown(t *testing.T) {
+	m, _ := NewManager(Config{})
+	defer m.Stop()
+	h := m.Register(NodeInfo{Tag: "unknown"})
+	h.MarkInitialCheckDone(true)
+	h.RecordSuccessWithLatency(time.Millisecond)
+	if !h.BeginExitLookup(false) {
+		t.Fatal("first lookup required traffic")
+	}
+	h.EndExitLookup("rate_limited")
+	if h.BeginExitLookup(true) {
+		t.Fatal("traffic bypassed cooldown")
+	}
+	h.ref.mu.Lock()
+	h.ref.exitAttemptedAt = time.Now().Add(-exitRefreshInterval)
+	h.ref.mu.Unlock()
+	if h.BeginExitLookup(false) {
+		t.Fatal("idle node retried")
+	}
+	h.MarkAvailable(false)
+	if h.BeginExitLookup(true) {
+		t.Fatal("unhealthy node retried")
+	}
+	h.MarkAvailable(true)
+	if !h.BeginExitLookup(true) {
+		t.Fatal("due exit was not retried after traffic")
+	}
+}
+
+func TestReloadRetainsExitAttemptsWithoutReusingUnhealthyNodes(t *testing.T) {
+	m, _ := NewManager(Config{})
+	defer m.Stop()
+	failed := NodeInfo{Tag: "failed", URI: "vless://failed@upstream.example:443"}
+	verified := NodeInfo{Tag: "verified", URI: "vless://verified@upstream.example:443"}
+	h := m.Register(failed)
+	h.MarkInitialCheckDone(true)
+	h.RecordSuccessWithLatency(time.Millisecond)
+	if !h.BeginExitLookup(false) {
+		t.Fatal("first lookup did not start")
+	}
+	h.EndExitLookup("rate_limited")
+	m.Register(verified).SetExit(ipmeta.Location{IP: "8.8.8.8", ISO: "US"})
+
+	finish := m.BeginNodeReload()
+	defer finish()
+	failed.Tag = "renamed"
+	h = m.Register(failed)
+	h.MarkInitialCheckDone(true)
+	h.RecordSuccessWithLatency(time.Millisecond)
+	if h.BeginExitLookup(false) || h.ref.snapshot().ExitProbeStatus != "rate_limited" {
+		t.Fatal("failed exit lookup was forgotten on reload")
+	}
+	h = m.Register(verified)
+	ip := netip.MustParseAddr("8.8.8.8")
+	if h.ref.snapshot().ExitIP != ip.String() || h.ExitRouteLatency(ip, time.Now()) != 0 {
+		t.Fatal("reload lost the confirmed exit or allowed routing without healthy status")
+	}
+	h.MarkInitialCheckDone(true)
+	h.RecordSuccessWithLatency(time.Millisecond)
+	if h.ExitRouteLatency(ip, time.Now()) == 0 {
+		t.Fatal("healthy node could not reuse the confirmed exit after reload")
 	}
 }

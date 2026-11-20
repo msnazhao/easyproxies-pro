@@ -309,9 +309,7 @@ func (p *poolOutbound) initializeMembersLocked() error {
 				member.entry = entry
 				entry.SetRelease(p.makeReleaseFunc(member))
 				entry.SetBlacklistFn(p.makeBlacklistByTagFunc(member.tag))
-				if probe := p.makeProbeFunc(member); probe != nil {
-					entry.SetProbe(probe)
-				}
+				p.setMemberProbe(member)
 			}
 		}
 		members = append(members, member)
@@ -414,6 +412,7 @@ func (p *poolOutbound) DialContext(ctx context.Context, network string, destinat
 		}
 		p.recordSuccess(member)
 		p.enrichExit(member, true)
+		p.scheduleExitLookup(member, true)
 		if lease != nil && network == N.NetworkTCP {
 			meta := p.options.Metadata[member.tag]
 			reason := "node_unavailable"
@@ -523,6 +522,7 @@ func (p *poolOutbound) ListenPacket(ctx context.Context, destination M.Socksaddr
 		}
 		p.recordSuccess(member)
 		p.enrichExit(member, true)
+		p.scheduleExitLookup(member, true)
 		return p.wrapPacketConn(conn, member), nil
 	}
 	if lastErr == nil {
@@ -628,7 +628,7 @@ func (p *poolOutbound) pickMemberFor(network string, tried map[string]bool, stic
 		for _, member := range p.membersByID[nodeID] {
 			if !tried[member.tag] && (network == "" || common.Contains(member.outbound.Network(), network)) &&
 				(member.entry == nil || member.entry.Available()) &&
-				(p.options.Region == "" || member.entry != nil && member.entry.Region() == p.options.Region) &&
+				(p.options.Region == "" || member.entry.ExitRegion() == p.options.Region) &&
 				(member.shared == nil || !member.shared.isBlacklisted(now)) {
 				p.mu.Unlock()
 				return member, nil
@@ -764,7 +764,7 @@ func (p *poolOutbound) availableMembersLocked(now time.Time, network string, buf
 		if member.entry != nil && !member.entry.Available() {
 			continue
 		}
-		if p.options.Region != "" && (member.entry == nil || !member.entry.ExitKnown() || member.entry.Region() != p.options.Region) {
+		if p.options.Region != "" && member.entry.ExitRegion() != p.options.Region {
 			continue
 		}
 		result = append(result, member)
@@ -1162,7 +1162,6 @@ func (p *poolOutbound) probeMember(ctx context.Context, member *memberState, des
 	if member.entry != nil {
 		member.entry.RecordSuccessWithLatency(duration)
 	}
-	p.scheduleExitLookup(member, monitor.PeriodicProbeSince(ctx))
 	// Clear a permanent pool blacklist on successful probe — a node that passes
 	// the health check should be available for selection immediately (fixes #8,
 	// #9). A live transient / rate-limit cooldown is deliberately preserved: the
@@ -1174,17 +1173,20 @@ func (p *poolOutbound) probeMember(ctx context.Context, member *memberState, des
 	return duration, nil
 }
 
-func (p *poolOutbound) makeProbeFunc(member *memberState) func(ctx context.Context) (time.Duration, error) {
-	if p.monitor == nil {
-		return nil
-	}
+func (p *poolOutbound) setMemberProbe(member *memberState) {
 	destination, host, useTLS, skipCertVerify, ok := p.monitor.DestinationForProbe()
 	if !ok {
-		return nil
+		return
 	}
-	return func(ctx context.Context) (time.Duration, error) {
+	member.entry.SetProbeWithSuccess(func(ctx context.Context) (time.Duration, error) {
 		return p.probeMember(ctx, member, destination, host, useTLS, skipCertVerify)
-	}
+	}, func(ctx context.Context) {
+		used := member.entry.UsedSince(monitor.PeriodicProbeSince(ctx))
+		p.scheduleExitLookup(member, used)
+		if used {
+			p.monitor.RefreshExitMetadata(p.ctx, member.entry)
+		}
+	})
 }
 
 // makeProbeByTagFunc creates a probe function that works before member initialization

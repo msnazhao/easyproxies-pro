@@ -141,7 +141,7 @@ func TestLateProbeResultDoesNotOverwriteNewerHealthyRun(t *testing.T) {
 	if _, err := mgr.Probe(context.Background(), "fixture"); err != nil {
 		t.Fatal(err)
 	}
-	if handle.ref.applyProbeResult(oldGeneration, oldLatency, oldError) {
+	if handle.ref.applyProbeResult(context.Background(), oldGeneration, oldLatency, oldError) {
 		t.Fatal("older probe generation was allowed to update node health")
 	}
 	snap := mgr.Snapshot()[0]

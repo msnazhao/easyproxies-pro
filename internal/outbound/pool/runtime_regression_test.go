@@ -3,6 +3,7 @@ package pool
 import (
 	"bufio"
 	"context"
+	"easy_proxies/internal/ipmeta"
 	"errors"
 	"fmt"
 	"io"
@@ -149,7 +150,7 @@ func TestBalanceRotatesDistinctExitsAndNodesWithinExit(t *testing.T) {
 		if i == 3 {
 			ip = "1.1.1.1"
 		}
-		entry.SetExit(ip, "US", "United States", "us", "ISP")
+		entry.SetExit(ipmeta.Location{IP: ip, ISO: "US", Country: "United States", Org: "ISP"})
 		member.entry = entry
 	}
 	counts := map[string]int{}
@@ -232,7 +233,7 @@ func TestHTTPSProbeBlacklistAndExplicitCertificateOverride(t *testing.T) {
 			}
 			defer mgr.Stop()
 			entry := mgr.Register(monitor.NodeInfo{Tag: "fixture"})
-			entry.SetExit("8.8.8.8", "US", "United States", "us", "Fixture")
+			entry.SetExit(ipmeta.Location{IP: "8.8.8.8", ISO: "US", Country: "United States", Org: "Fixture"})
 			state := &sharedMemberState{}
 			state.attachEntry(entry)
 			p := newSessionTestPool(nil)

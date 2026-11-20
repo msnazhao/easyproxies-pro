@@ -53,7 +53,7 @@ func (a Abuse) NetworkType() string {
 	return "unknown"
 }
 
-// Service survives runtime reloads. Each provider has one serialized request
+// Service survives runtime reloads. Each provider has a serialized request
 // lane and its own keep-alive transport, cache and key cooldowns.
 type Service struct {
 	mu                sync.RWMutex
@@ -134,7 +134,7 @@ func acquire(ctx context.Context, p *provider) error {
 }
 
 func (p *provider) request(ctx context.Context, keys []string, endpoint string, abuse bool, dst any, client *http.Client) error {
-
+	throughNode := client != nil
 	if client == nil {
 		client = p.client
 	}
@@ -166,6 +166,11 @@ func (p *provider) request(ctx context.Context, keys []string, endpoint string, 
 		if resp.StatusCode == http.StatusOK && readErr == nil && json.Unmarshal(body, dst) == nil {
 			p.next = index
 			return nil
+		}
+		// Transport errors, access blocks, and invalid responses through one
+		// exit must not disable the same key for all other exits.
+		if throughNode && resp.StatusCode != http.StatusUnauthorized && resp.StatusCode != http.StatusTooManyRequests {
+			break
 		}
 		delay := time.Minute
 		if resp.StatusCode == 401 || resp.StatusCode == 403 {

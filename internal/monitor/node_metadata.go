@@ -2,9 +2,11 @@ package monitor
 
 import (
 	"net/netip"
+	"strings"
 	"time"
 
 	"easy_proxies/internal/config"
+	"easy_proxies/internal/geoip"
 	"easy_proxies/internal/ipmeta"
 )
 
@@ -18,20 +20,27 @@ func nodeIdentity(info NodeInfo) string {
 }
 
 type nodeMeasurements struct {
-	info           NodeInfo
-	exitIP         netip.Addr
-	exitVerifiedAt time.Time
-	lastProbe      time.Duration
-	lastProbeAt    time.Time
+	info             NodeInfo
+	exitIP           netip.Addr
+	exitVerifiedAt   time.Time
+	exitAttemptedAt  time.Time
+	exitProbeFailure string
+	lastProbe        time.Duration
+	lastProbeAt      time.Time
 }
 
 func (m nodeMeasurements) restore(e *entry, now time.Time) {
-	if now.Sub(m.exitVerifiedAt) >= exitRoutingTTL || now.Sub(m.lastProbeAt) >= exitRoutingTTL {
+	e.exitAttemptedAt = m.exitAttemptedAt
+	e.exitProbeFailure = m.exitProbeFailure
+	if now.Sub(m.exitVerifiedAt) >= exitRoutingTTL {
 		return
 	}
 	copyExitMetadata(&e.info, m.info)
 	formatNodeName(&e.info)
 	e.exitIP, e.exitVerifiedAt = m.exitIP, m.exitVerifiedAt
+	if now.Sub(m.lastProbeAt) >= exitRoutingTTL {
+		return
+	}
 	e.lastProbe, e.lastProbeAt, e.lastOK = m.lastProbe, m.lastProbeAt, m.lastProbeAt
 	e.initialCheckDone, e.available = true, true
 }
@@ -49,6 +58,26 @@ func copyExitMetadata(dst *NodeInfo, src NodeInfo) {
 	dst.OrgShort = src.OrgShort
 	dst.NetworkType = src.NetworkType
 	dst.Abuse = src.Abuse
+}
+
+func (info *NodeInfo) mergeExitLocation(location ipmeta.Location) {
+	if iso := geoip.NormalizeCountryCode(location.ISO); iso != "" {
+		country := strings.TrimSpace(location.Country)
+		if info.CountryCode != iso || country != "" {
+			info.Country = country
+		}
+		info.CountryCode = iso
+		info.Region = geoip.RegionForISO(iso)
+	}
+	if provider := strings.TrimSpace(location.Org); provider != "" {
+		info.Provider = provider
+	}
+	if asn := strings.TrimSpace(location.ASN); asn != "" {
+		info.ASN = asn
+	}
+	if domain := strings.TrimSpace(location.Domain); domain != "" {
+		info.OrgDomain = domain
+	}
 }
 
 func formatNodeName(info *NodeInfo) {

@@ -1,6 +1,8 @@
 package monitor
 
 import (
+	"context"
+	"easy_proxies/internal/ipmeta"
 	"encoding/base64"
 	"encoding/json"
 	"net/http"
@@ -137,7 +139,7 @@ func TestExitProxySubscriptionSOCKS5WithoutAuth(t *testing.T) {
 		{Tag: "stale-probe", Name: "Stale health probe", URI: "vless://u@j:443", CountryCode: "US", NetworkType: "isp", ExitIP: "149.112.112.112"},
 	} {
 		entry := registerHealthySubscriptionNode(s.mgr, node)
-		entry.SetExit(node.ExitIP, node.CountryCode, "", "", "")
+		entry.SetExit(ipmeta.Location{IP: node.ExitIP, ISO: node.CountryCode})
 		entry.ref.mu.Lock()
 		entry.ref.info.NetworkType = node.NetworkType
 		entry.ref.info.Name = node.Name
@@ -201,7 +203,7 @@ func TestSubscriptionsRequireSuccessfulHealthProbe(t *testing.T) {
 		"blacklisted": "1.1.1.1", "unprobed": "1.0.0.1",
 	} {
 		entry := s.mgr.Register(NodeInfo{Tag: tag, Name: tag, URI: "vless://fixture@" + tag + ".example:443"})
-		entry.SetExit(ip, "US", "", "", "")
+		entry.SetExit(ipmeta.Location{IP: ip, ISO: "US"})
 		switch tag {
 		case "healthy", "blacklisted":
 			entry.RecordSuccessWithLatency(time.Millisecond)
@@ -252,7 +254,7 @@ func TestExitSubscriptionRetainsFreshMeasurementsAcrossReload(t *testing.T) {
 	s, _ := newProxySessionTestServer(t, proxySessionTestConfig())
 	info := NodeInfo{Tag: "original", Name: "Original", URI: "vless://fixture@upstream.example:443#original"}
 	old := registerHealthySubscriptionNode(s.mgr, info)
-	old.SetExit("8.8.8.8", "US", "", "", "")
+	old.SetExit(ipmeta.Location{IP: "8.8.8.8", ISO: "US"})
 	verifiedAt := s.mgr.Snapshot()[0].ExitVerifiedAt
 
 	finish := s.mgr.BeginNodeReload()
@@ -268,5 +270,84 @@ func TestExitSubscriptionRetainsFreshMeasurementsAcrossReload(t *testing.T) {
 	if result.Code != http.StatusOK || !strings.Contains(result.Body.String(), "._ip_8.8.8.8") ||
 		!strings.Contains(result.Body.String(), "Renamed") {
 		t.Fatalf("valid exit disappeared or retained the old name after reload: status=%d", result.Code)
+	}
+}
+
+func TestPartialExitLookupPreservesCountryFilterForTheSameAddress(t *testing.T) {
+	s, _ := newProxySessionTestServer(t, proxySessionTestConfig())
+	h := registerHealthySubscriptionNode(s.mgr, NodeInfo{Tag: "fixture", URI: "vless://fixture@upstream.example:443"})
+	h.SetExit(ipmeta.Location{IP: "8.8.8.8", ISO: "US", Country: "United States", Org: "Example ISP", ASN: "AS123", Domain: "example.com"})
+	h.SetExit(ipmeta.Location{IP: "::ffff:8.8.8.8", ISO: "ZZ"})
+	info := s.mgr.Snapshot()[0].NodeInfo
+	if info.CountryCode != "US" || info.Country != "United States" || info.Region != "us" ||
+		info.Provider != "Example ISP" || info.ASN != "AS123" || info.OrgDomain != "example.com" {
+		t.Fatalf("partial response erased metadata: %+v", info)
+	}
+	result := proxyAPIRequest(t, s, http.MethodGet, "/sub/proxies2?c=US", "")
+	if result.Code != http.StatusOK || !strings.Contains(result.Body.String(), "._ip_8.8.8.8") {
+		t.Fatalf("country filter lost same-IP exit: %d %s", result.Code, result.Body)
+	}
+	h.SetExit(ipmeta.Location{IP: "1.1.1.1"})
+	info = s.mgr.Snapshot()[0].NodeInfo
+	if info.CountryCode != "" || info.Country != "" || info.Region != "" || info.Provider != "" || info.ASN != "" || info.OrgDomain != "" {
+		t.Fatalf("new IP inherited old metadata: %+v", info)
+	}
+	result = proxyAPIRequest(t, s, http.MethodGet, "/sub/proxies2", "")
+	if result.Code != http.StatusOK || !strings.Contains(result.Body.String(), "._ip_1.1.1.1") {
+		t.Fatalf("address-only exit disappeared from unfiltered subscription: %d %s", result.Code, result.Body)
+	}
+	result = proxyAPIRequest(t, s, http.MethodGet, "/sub/proxies2?c=US", "")
+	if strings.Contains(result.Body.String(), "._ip_1.1.1.1") {
+		t.Fatalf("unclassified exit passed country filter: %s", result.Body)
+	}
+}
+
+func TestExitSubscriptionIncludesNodeAfterTrafficTriggersRecheck(t *testing.T) {
+	s, _ := newProxySessionTestServer(t, proxySessionTestConfig())
+	m := s.mgr
+	known := registerHealthySubscriptionNode(m, NodeInfo{Tag: "known", Name: "Known"})
+	known.SetExit(ipmeta.Location{IP: "8.8.8.8", ISO: "US"})
+	known.SetProbe(func(context.Context) (time.Duration, error) {
+		t.Error("already verified idle node was probed")
+		return time.Millisecond, nil
+	})
+
+	pending := registerHealthySubscriptionNode(m, NodeInfo{Tag: "pending", Name: "Recovered"})
+	if !pending.BeginExitLookup(false) {
+		t.Fatal("could not queue initial exit discovery")
+	}
+	pending.EndExitLookup("failed")
+	pending.ref.mu.Lock()
+	pending.ref.exitAttemptedAt = time.Now().Add(-exitRefreshInterval)
+	pending.ref.mu.Unlock()
+	attempts := 1
+	pending.SetProbe(func(ctx context.Context) (time.Duration, error) {
+		if !pending.BeginExitLookup(pending.UsedSince(PeriodicProbeSince(ctx))) {
+			t.Error("recovery probe did not start exit discovery")
+			return time.Millisecond, nil
+		}
+		attempts++
+		pending.SetExit(ipmeta.Location{IP: "1.1.1.1", ISO: "US"})
+		pending.EndExitLookup("")
+		return time.Millisecond, nil
+	})
+	read := func() string {
+		t.Helper()
+		result := proxyAPIRequest(t, s, http.MethodGet, "/sub/proxies2?c=US", "")
+		if result.Code != http.StatusOK {
+			t.Fatalf("subscription status = %d", result.Code)
+		}
+		return result.Body.String()
+	}
+	since := time.Now().Add(-5 * time.Minute)
+	m.probeNodes(time.Second, since)
+	if attempts != 1 || strings.Contains(read(), "._ip_1.1.1.1") {
+		t.Fatal("unverified exit appeared in the subscription")
+	}
+	pending.IncActive()
+	pending.DecActive()
+	m.probeNodes(time.Second, since)
+	if attempts != 2 || !strings.Contains(read(), "._ip_1.1.1.1") {
+		t.Fatalf("exit did not recover after traffic: attempts=%d", attempts)
 	}
 }

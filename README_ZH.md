@@ -172,7 +172,7 @@ GeoIP 路由器复用 `listener.username` 和 `listener.password` 进行代理�
 
 - 首次启动时会自动下载 MaxMind GeoLite2-Country 数据库。
 - 默认每 24 小时检查更新，并热重载数据库，无需重启。
-- 健康探测首次成功后通过节点查询公网出口 IP、国家和网络提供商。仪表盘地区过滤与地区路由均按出口 IP 归属分类。周期检查仅覆盖当前有代理连接或最近一轮内处理过连接的节点，启动、重载和手动探测可发现空闲节点。
+- 节点通过健康检查后，立即安排首次公网出口 IP 探测。仪表盘地区过滤与地区路由均按出口 IP 归属分类。出口复测由实际代理流量触发，周期检查覆盖当前有连接或最近一轮内处理过连接的节点。
 - 健康检查默认使用 HTTPS 并严格校验证书；失败的代理立即拉黑，按 `pool.blacklist_duration` 到期或人工解封。只有主动开启 `skip_cert_verify` 才会跳过证书校验，探测仍通过 HTTPS 进行。
 - `other` 仅包含已确认出口属于其他国家的节点；出口信息未知的节点不会被国家路由选中。入口国家来自 GeoIP 数据库，跨国中转在监控列表显示为入口 → 出口。
 
@@ -305,7 +305,7 @@ dns:
 
 ## 出口信息与风险查询
 
-系统设置新增 IPinfo 和 AbuseIPDB key 列表，每行一个，保存至 `config.yaml` 的 `ip_metadata.ipinfo_keys` 和 `ip_metadata.abuseipdb_keys`。配置文件包含凭据，请限制访问。出口探测优先经节点请求 IPinfo Lite 的 `/lite/me`，再用 IPify 复核；没有可用的 IPinfo key 时，先用 IPify，再用 `ipapi.co` 复核。两者返回的 IP 一致才记录出口；可用时国家、ASN 和组织以 IPinfo Lite 为准。IPinfo 和 AbuseIPDB 各自串行执行，认证或配额失败时切换 key 并冷却。
+系统设置可配置 IPinfo 和 AbuseIPDB key，每行一个，保存至 `config.yaml` 的 `ip_metadata.ipinfo_keys` 和 `ip_metadata.abuseipdb_keys`。出口探测优先经节点请求 IPinfo Lite 的 `/lite/me`，再用 IPify 复核。如果 IPinfo 查询不可用，则使用 IPify 和 `ipapi.co`。两个来源返回相同地址后确认出口，国家、ASN 和组织可随后补齐。进程最多同时运行 16 个出口探测任务，IPinfo 和 AbuseIPDB 各自串行请求。已尝试过的节点有实际代理流量且距离上次探测至少 15 分钟时才安排复测。
 
 AbuseIPDB 没有 key 时不请求。出口发现后，已知机房组织等到实际代理连接成功后再查询，其他节点在发现阶段查询使用类型和最近 90 天的风险分数。相同出口 IP 共享 24 小时缓存，失败后间隔至少 1 小时再查。周期刷新覆盖活跃节点，出口变化后按新 IP 查询。程序重启会清空内存缓存。
 

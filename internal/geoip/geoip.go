@@ -22,6 +22,7 @@ import (
 
 	"github.com/oschwald/geoip2-golang"
 	"golang.org/x/sync/singleflight"
+	"golang.org/x/text/language"
 )
 
 // Region codes
@@ -691,8 +692,26 @@ func isoCodeToRegion(isoCode string) string {
 	}
 }
 
-// RegionForISO returns the configured routing bucket for a measured exit ISO code.
-func RegionForISO(code string) string { return isoCodeToRegion(code) }
+// NormalizeCountryCode returns a normalized ISO alpha-2 country code, if known.
+func NormalizeCountryCode(code string) string {
+	code = strings.ToUpper(strings.TrimSpace(code))
+	if len(code) != 2 {
+		return ""
+	}
+	region, err := language.ParseRegion(code)
+	if err != nil || !region.IsCountry() || region.IsPrivateUse() {
+		return ""
+	}
+	return code
+}
+
+// RegionForISO returns the routing bucket for a known country code.
+func RegionForISO(code string) string {
+	if code = NormalizeCountryCode(code); code == "" {
+		return ""
+	}
+	return isoCodeToRegion(code)
+}
 
 // AllRegions returns all supported region codes
 func AllRegions() []string {

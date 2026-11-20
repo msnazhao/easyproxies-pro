@@ -3,6 +3,7 @@ package boxmgr
 import (
 	"bufio"
 	"context"
+	"easy_proxies/internal/ipmeta"
 	"encoding/base64"
 	"errors"
 	"fmt"
@@ -373,7 +374,7 @@ func TestSessionRoutingLocalStrictExit(t *testing.T) {
 		if node.Name == "node-b" {
 			exit = "8.8.8.8"
 		}
-		entry.SetExit(exit, "", "", "", "")
+		entry.SetExit(ipmeta.Location{IP: exit})
 	}
 	for _, call := range []func(*testing.T, *config.Config, string) string{
 		sessionLocalHTTPNode, sessionLocalCONNECTNode, sessionLocalSOCKSNode,

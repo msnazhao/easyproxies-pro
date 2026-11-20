@@ -1652,10 +1652,11 @@
         else if(status === 'pending') { badge='badge-offline'; statusText='等待检查'; }
         else if(status === 'unavailable') { badge='badge-error'; statusText='不可用'; }
         else { badge='badge-healthy'; statusText='健康在线'; }
+        const exitStatus = {pending:'检测中', failed:'出口检测失败', mismatch:'出口 IP 不一致', rate_limited:'出口查询受限'}[n.exit_probe_status] || (status === 'unavailable' || status === 'blacklisted' ? '节点不可用' : '待检测');
 
         return `<tr>
           <td><span class="badge ${badge}" title="${escapeHtml(n.last_error || statusText)}">${statusText}</span></td>
-          <td><div class="cell-trunc" title="${escapeHtml(n.exit_ip || '出口待检测')}">${escapeHtml(n.exit_ip ? ((n.entry_iso && n.country_code && n.entry_iso !== n.country_code ? n.entry_iso + ' → ' : '') + (n.country_code || n.country || '未知')) : '待检测')}</div><div class="cell-trunc" style="font-size:11px;color:var(--text-muted)" title="${escapeHtml([n.provider, n.asn, n.org_domain, n.abuse?.usageType, n.abuse?.abuseConfidenceScore != null ? 'Abuse: '+n.abuse.abuseConfidenceScore : '', n.abuse?.isTor != null ? 'Tor: '+n.abuse.isTor : ''].filter(Boolean).join(' | '))}">${escapeHtml(n.org_short || n.provider || '-')}</div></td>
+          <td><div class="cell-trunc" title="${escapeHtml(n.exit_ip || exitStatus)}">${escapeHtml(n.exit_ip ? ((n.entry_iso && n.country_code && n.entry_iso !== n.country_code ? n.entry_iso + ' → ' : '') + (n.country_code || n.country || '未知')) : exitStatus)}</div><div class="cell-trunc" style="font-size:11px;color:var(--text-muted)" title="${escapeHtml([n.provider, n.asn, n.org_domain, n.abuse?.usageType, n.abuse?.abuseConfidenceScore != null ? 'Abuse: '+n.abuse.abuseConfidenceScore : '', n.abuse?.isTor != null ? 'Tor: '+n.abuse.isTor : ''].filter(Boolean).join(' | '))}">${escapeHtml(n.org_short || n.provider || '-')}</div></td>
           <td class="tt-mono" style="overflow-wrap:anywhere">${escapeHtml(n.exit_ip || '-')}</td>
           <td>
             <div class="cell-trunc" style="font-weight: 500" title="${escapeHtml(n.name || n.tag)}">${escapeHtml(n.name || n.tag)}</div>

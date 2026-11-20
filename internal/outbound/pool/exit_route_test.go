@@ -2,6 +2,7 @@ package pool
 
 import (
 	"context"
+	"easy_proxies/internal/ipmeta"
 	"errors"
 	"net/netip"
 	"testing"
@@ -31,7 +32,7 @@ func TestExitRouteOnlyRetriesDistinctVerifiedNodes(t *testing.T) {
 		if member.tag == "other" {
 			exit = "1.1.1.1"
 		}
-		entry.SetExit(exit, "", "", "", "")
+		entry.SetExit(ipmeta.Location{IP: exit})
 		member.entry = entry
 	}
 	ctx := routing.WithExitIP(context.Background(), ip)
@@ -46,7 +47,7 @@ func TestExitRouteOnlyRetriesDistinctVerifiedNodes(t *testing.T) {
 	packet.Close()
 
 	fast.setDialHook(func(context.Context) error {
-		p.members[1].entry.SetExit("1.1.1.1", "", "", "", "")
+		p.members[1].entry.SetExit(ipmeta.Location{IP: "1.1.1.1"})
 		return nil
 	})
 	mustSessionTestDial(t, ctx, p, "backup")

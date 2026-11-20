@@ -58,7 +58,7 @@ func TestRegistrationReusedTagDoesNotInheritMetadata(t *testing.T) {
 	h.MarkInitialCheckDone(true)
 	replacement := m.Register(NodeInfo{Tag: "shared", Name: "second", URI: "trojan://new@new.example:443"})
 	// Simulate an old request completing after registration of a different node.
-	h.SetExit("8.8.8.8", "US", "United States", "us", "Old ISP")
+	h.SetExit(ipmeta.Location{IP: "8.8.8.8", ISO: "US", Country: "United States", Org: "Old ISP"})
 	snap := m.Snapshot()[0]
 	if replacement.ref == h.ref || snap.Name != "second" || snap.ExitIP != "" || snap.NetworkType != "" || snap.InitialCheckDone {
 		t.Fatalf("reused tag leaked old node state: %+v", snap)
@@ -123,14 +123,14 @@ func TestMetadataForPreviousExitCannotOverwriteNewExit(t *testing.T) {
 	m.Metadata.AbuseURL = api.URL
 	m.Metadata.Configure(ipmeta.Config{AbuseKeys: []string{"fixture"}})
 	h := m.Register(NodeInfo{Tag: "a", Name: "Original"})
-	h.SetExit("1.1.1.1", "AU", "", "", "")
+	h.SetExit(ipmeta.Location{IP: "1.1.1.1", ISO: "AU"})
 	m.EnrichExit(context.Background(), h, false)
 	select {
 	case <-oldStarted:
 	case <-time.After(3 * time.Second):
 		t.Fatal("old lookup did not start")
 	}
-	h.SetExit("8.8.8.8", "US", "", "", "")
+	h.SetExit(ipmeta.Location{IP: "8.8.8.8", ISO: "US"})
 	m.EnrichExit(context.Background(), h, false)
 	release.Do(func() { close(releaseOld) })
 

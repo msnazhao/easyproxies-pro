@@ -4,7 +4,6 @@ import (
 	"context"
 	"time"
 
-	"easy_proxies/internal/geoip"
 	"easy_proxies/internal/ipmeta"
 )
 
@@ -48,17 +47,11 @@ func (m *Manager) enrichExit(ctx context.Context, h *EntryHandle, used, refresh 
 				m.EnrichExit(ctx, h, false)
 			}
 		}()
-		if info.OriginalName == "" {
-			info.OriginalName = info.Name
-		}
+		var location ipmeta.Location
 		if needsEnrichment && m.Metadata.HasInfo() {
-			if location, err := m.Metadata.Lookup(ctx, info.ExitIP); err == nil {
-				info.CountryCode = location.ISO
-				info.Country = location.Country
-				info.Region = geoip.RegionForISO(location.ISO)
-				info.Provider = location.Org
-				info.ASN = location.ASN
-				info.OrgDomain = location.Domain
+			if result, err := m.Metadata.Lookup(ctx, info.ExitIP); err == nil {
+				location = result
+				info.mergeExitLocation(location)
 			}
 		}
 		h.ref.mu.RLock()
@@ -75,14 +68,7 @@ func (m *Manager) enrichExit(ctx context.Context, h *EntryHandle, used, refresh 
 			h.ref.mu.Unlock()
 			return
 		}
-		if needsEnrichment {
-			h.ref.info.CountryCode = info.CountryCode
-			h.ref.info.Country = info.Country
-			h.ref.info.Region = info.Region
-			h.ref.info.Provider = info.Provider
-			h.ref.info.ASN = info.ASN
-			h.ref.info.OrgDomain = info.OrgDomain
-		}
+		h.ref.info.mergeExitLocation(location)
 		h.ref.info.Abuse = info.Abuse
 		h.ref.info.NetworkType = info.NetworkType
 		formatNodeName(&h.ref.info)

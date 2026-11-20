@@ -76,6 +76,7 @@ type Snapshot struct {
 	LastSuccess       time.Time       `json:"last_success,omitempty"`
 	LastProbeLatency  time.Duration   `json:"last_probe_latency,omitempty"`
 	ExitVerifiedAt    time.Time       `json:"exit_verified_at,omitzero"`
+	ExitProbeStatus   string          `json:"exit_probe_status,omitempty"`
 	LastLatencyMs     int64           `json:"last_latency_ms"`
 	Available         bool            `json:"available"`
 	InitialCheckDone  bool            `json:"initial_check_done"`
@@ -128,9 +129,11 @@ type entry struct {
 	active            atomic.Int32
 	lastUsedAt        atomic.Int64
 	probe             probeFunc
+	afterProbeSuccess func(context.Context)
 	probeRun          *probeRun
 	probeGeneration   uint64
 	exitPending       bool
+	exitProbeFailure  string
 	exitIP            netip.Addr
 	exitVerifiedAt    time.Time
 	exitAttemptedAt   time.Time
@@ -486,7 +489,7 @@ func (m *Manager) runProbeSweep(timeout time.Duration, since time.Time) {
 				return
 			}
 
-			if !entry.applyProbeResult(generation, latency, err) {
+			if !entry.applyProbeResult(ctx, generation, latency, err) {
 				m.probeSweepDone.Add(1)
 				return
 			}
@@ -576,20 +579,27 @@ func (m *Manager) Register(info NodeInfo) *EntryHandle {
 	return &EntryHandle{ref: e}
 }
 
-// BeginNodeReload passes valid measurements to matching nodes in the replacement
-// runtime. New entries keep old callbacks isolated and retain original probe times.
+// BeginNodeReload passes exit attempts and fresh measurements to matching nodes
+// in the replacement runtime. New entries keep old callbacks isolated.
 func (m *Manager) BeginNodeReload() func() {
 	m.mu.Lock()
 	now := time.Now()
 	m.reloadMeasures = make(map[string]nodeMeasurements)
 	for _, e := range m.nodes {
 		e.mu.RLock()
-		if e.info.URI != "" && e.exitRouteReadyLocked(now) {
+		if e.info.URI != "" && (!e.exitAttemptedAt.IsZero() || !e.exitVerifiedAt.IsZero()) {
 			key := nodeIdentity(e.info)
-			m.reloadMeasures[key] = nodeMeasurements{
-				info: e.info, exitIP: e.exitIP, exitVerifiedAt: e.exitVerifiedAt,
-				lastProbe: e.lastProbe, lastProbeAt: e.lastProbeAt,
+			measurements := nodeMeasurements{exitAttemptedAt: e.exitAttemptedAt, exitProbeFailure: e.exitProbeFailure}
+			if e.exitVerifiedAt.After(measurements.exitAttemptedAt) {
+				measurements.exitAttemptedAt = e.exitVerifiedAt
 			}
+			if e.exitIP.IsValid() && now.Sub(e.exitVerifiedAt) < exitRoutingTTL {
+				measurements.info, measurements.exitIP, measurements.exitVerifiedAt = e.info, e.exitIP, e.exitVerifiedAt
+			}
+			if e.exitRouteReadyLocked(now) {
+				measurements.lastProbe, measurements.lastProbeAt = e.lastProbe, e.lastProbeAt
+			}
+			m.reloadMeasures[key] = measurements
 		}
 		e.mu.RUnlock()
 	}
@@ -708,7 +718,7 @@ func (m *Manager) Probe(ctx context.Context, tag string) (time.Duration, error) 
 		return 0, err
 	}
 
-	e.applyProbeResult(generation, latency, err)
+	e.applyProbeResult(probeCtx, generation, latency, err)
 
 	if err != nil {
 		return 0, err
@@ -718,10 +728,10 @@ func (m *Manager) Probe(ctx context.Context, tag string) (time.Duration, error) 
 
 // A completed run can have several waiting callers. A late caller from a
 // previous run must not overwrite the health result of a newer run.
-func (e *entry) applyProbeResult(generation uint64, latency time.Duration, err error) bool {
+func (e *entry) applyProbeResult(ctx context.Context, generation uint64, latency time.Duration, err error) bool {
 	e.mu.Lock()
-	defer e.mu.Unlock()
 	if generation != e.probeGeneration {
+		e.mu.Unlock()
 		return false
 	}
 	e.initialCheckDone = true
@@ -735,6 +745,11 @@ func (e *entry) applyProbeResult(generation uint64, latency time.Duration, err e
 		e.lastProbe = latency
 		e.lastProbeAt = e.lastOK
 		e.available = true
+	}
+	afterSuccess := e.afterProbeSuccess
+	e.mu.Unlock()
+	if err == nil && afterSuccess != nil {
+		afterSuccess(ctx)
 	}
 	return true
 }
@@ -833,6 +848,10 @@ func (e *entry) snapshot() Snapshot {
 	if e.exitRouteReadyLocked(now) {
 		exitRouteIP = e.exitIP
 	}
+	exitProbeStatus := e.exitProbeFailure
+	if e.exitPending {
+		exitProbeStatus = "pending"
+	}
 	latencyMs := int64(-1)
 	if e.lastProbe > 0 {
 		latencyMs = e.lastProbe.Milliseconds()
@@ -859,6 +878,7 @@ func (e *entry) snapshot() Snapshot {
 		LastSuccess:       e.lastOK,
 		LastProbeLatency:  e.lastProbe,
 		ExitVerifiedAt:    e.exitVerifiedAt,
+		ExitProbeStatus:   exitProbeStatus,
 		LastLatencyMs:     latencyMs,
 		Available:         e.available,
 		InitialCheckDone:  e.initialCheckDone,
@@ -940,12 +960,6 @@ func (e *entry) decActive() {
 	e.active.Add(-1)
 }
 
-func (e *entry) setProbe(fn probeFunc) {
-	e.mu.Lock()
-	defer e.mu.Unlock()
-	e.probe = fn
-}
-
 func (e *entry) setRelease(fn releaseFunc) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
@@ -1010,10 +1024,18 @@ func (h *EntryHandle) DecActive() {
 
 // SetProbe assigns a probe function.
 func (h *EntryHandle) SetProbe(fn func(ctx context.Context) (time.Duration, error)) {
+	h.SetProbeWithSuccess(fn, nil)
+}
+
+// SetProbeWithSuccess runs afterSuccess when the manager records a healthy result.
+func (h *EntryHandle) SetProbeWithSuccess(fn func(context.Context) (time.Duration, error), afterSuccess func(context.Context)) {
 	if h == nil || h.ref == nil {
 		return
 	}
-	h.ref.setProbe(fn)
+	h.ref.mu.Lock()
+	h.ref.probe = fn
+	h.ref.afterProbeSuccess = afterSuccess
+	h.ref.mu.Unlock()
 }
 
 // SetRelease assigns a release function.
@@ -1075,11 +1097,11 @@ const (
 )
 
 // SetExit publishes a verified address and discards metadata belonging to the old address.
-func (h *EntryHandle) SetExit(ip, iso, country, region, provider string) {
+func (h *EntryHandle) SetExit(location ipmeta.Location) {
 	if h == nil || h.ref == nil {
 		return
 	}
-	address, err := netip.ParseAddr(ip)
+	address, err := netip.ParseAddr(location.IP)
 	if err != nil {
 		return
 	}
@@ -1092,10 +1114,7 @@ func (h *EntryHandle) SetExit(ip, iso, country, region, provider string) {
 	}
 	h.ref.exitIP = address
 	h.ref.info.ExitIP = address.String()
-	h.ref.info.CountryCode = iso
-	h.ref.info.Country = country
-	h.ref.info.Region = region
-	h.ref.info.Provider = provider
+	h.ref.info.mergeExitLocation(location)
 	formatNodeName(&h.ref.info)
 }
 
@@ -1117,21 +1136,36 @@ func (e *entry) clearExitMetadata() {
 	e.nextAbuseCheck = time.Time{}
 }
 
-// BeginExitLookup coalesces concurrent checks of the same node.
-func (h *EntryHandle) BeginExitLookup() bool {
+// BeginExitLookup allows initial discovery after a successful health check.
+// Subsequent attempts also require recent traffic and respect the cooldown.
+func (h *EntryHandle) BeginExitLookup(used bool) bool {
 	if h == nil || h.ref == nil {
 		return false
 	}
 	h.ref.mu.Lock()
 	defer h.ref.mu.Unlock()
 	now := time.Now()
-	if h.ref.exitPending || now.Sub(h.ref.exitVerifiedAt) < exitRefreshInterval ||
-		now.Sub(h.ref.exitAttemptedAt) < time.Minute {
+	e := h.ref
+	if !e.hasSuccessfulHealthCheckLocked() || e.exitPending || now.Sub(e.exitVerifiedAt) < exitRefreshInterval ||
+		now.Sub(e.exitAttemptedAt) < exitRefreshInterval {
 		return false
 	}
-	h.ref.exitPending = true
-	h.ref.exitAttemptedAt = now
+	if !used && (!e.exitAttemptedAt.IsZero() || !e.exitVerifiedAt.IsZero()) {
+		return false
+	}
+	e.exitPending = true
 	return true
+}
+
+// ExitLookupHealthy rechecks the health status when a queued lookup can run.
+func (h *EntryHandle) ExitLookupHealthy() bool {
+	h.ref.mu.RLock()
+	defer h.ref.mu.RUnlock()
+	return h.ref.hasSuccessfulHealthCheckLocked()
+}
+
+func (e *entry) hasSuccessfulHealthCheckLocked() bool {
+	return e.initialCheckDone && e.available && e.lastProbe > 0
 }
 
 // ExitRouteLatency returns the measured latency of a healthy, recently verified exit.
@@ -1149,7 +1183,7 @@ func (h *EntryHandle) ExitRouteLatency(ip netip.Addr, now time.Time) time.Durati
 }
 
 func (e *entry) exitRouteReadyLocked(now time.Time) bool {
-	return e.exitIP.IsValid() && e.lastProbe > 0 && e.initialCheckDone && e.available &&
+	return e.exitIP.IsValid() && e.hasSuccessfulHealthCheckLocked() &&
 		now.Sub(e.exitVerifiedAt) < exitRoutingTTL && now.Sub(e.lastProbeAt) < exitRoutingTTL &&
 		!(e.blacklist && (e.until.IsZero() || now.Before(e.until)))
 }
@@ -1162,12 +1196,16 @@ func (h *EntryHandle) UsedSince(since time.Time) bool {
 	return h != nil && h.ref != nil && h.ref.usedSince(since)
 }
 
-func (h *EntryHandle) EndExitLookup() {
+func (h *EntryHandle) EndExitLookup(failure string) {
 	if h == nil || h.ref == nil {
 		return
 	}
 	h.ref.mu.Lock()
 	h.ref.exitPending = false
+	if failure != "canceled" {
+		h.ref.exitAttemptedAt = time.Now()
+		h.ref.exitProbeFailure = failure
+	}
 	h.ref.mu.Unlock()
 }
 
@@ -1213,12 +1251,15 @@ func (h *EntryHandle) ExitIP() string {
 	return h.ref.info.ExitIP
 }
 
-func (h *EntryHandle) Region() string {
+func (h *EntryHandle) ExitRegion() string {
 	if h == nil || h.ref == nil {
 		return ""
 	}
 	h.ref.mu.RLock()
 	defer h.ref.mu.RUnlock()
+	if h.ref.info.ExitIP == "" || h.ref.info.CountryCode == "" {
+		return ""
+	}
 	return h.ref.info.Region
 }
 

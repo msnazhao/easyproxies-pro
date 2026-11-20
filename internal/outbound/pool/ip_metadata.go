@@ -21,58 +21,65 @@ import (
 )
 
 var errExitProbeMismatch = errors.New("exit probes disagree")
+var errExitProbeRateLimited = errors.New("exit probe rate limited")
 
-func (p *poolOutbound) scheduleExitLookup(member *memberState, since time.Time) {
+func (p *poolOutbound) scheduleExitLookup(member *memberState, used bool) {
 	entry := member.entry
-	if p.ctx.Err() != nil || (!since.IsZero() && !entry.UsedSince(since)) {
+	if entry == nil || p.ctx.Err() != nil {
 		return
 	}
-	if !entry.BeginExitLookup() {
-		if entry.UsedSince(since) && p.monitor != nil {
-			p.monitor.RefreshExitMetadata(p.ctx, entry)
-		}
+	if !entry.BeginExitLookup(used) {
 		return
 	}
-	go func() {
-		defer entry.EndExitLookup()
-		select {
-		case exitLookupGate <- struct{}{}:
-			defer func() { <-exitLookupGate }()
-		case <-p.ctx.Done():
-			return
-		}
-		if p.ctx.Err() != nil || (!since.IsZero() && !entry.UsedSince(since)) {
-			return
-		}
-		location, err := p.lookupExit(member)
-		if p.ctx.Err() != nil {
-			return
-		}
-		if err == nil {
-			entry.SetExit(location.IP, location.ISO, location.Country, geoip.RegionForISO(location.ISO), location.Org)
-			if p.monitor != nil {
-				if entry.UsedSince(since) {
-					p.monitor.RefreshExitMetadata(p.ctx, entry)
-				} else {
-					p.monitor.EnrichExit(p.ctx, entry, false)
-				}
-			}
-			return
-		}
-		if errors.Is(err, errExitProbeMismatch) {
-			entry.InvalidateExit()
-		}
-		if count := exitLookupErrors.Add(1); count <= 5 {
-			log.Printf("[pool] exit lookup failed for %s: %v", member.tag, err)
-		} else if count == 6 {
-			log.Printf("[pool] further exit lookup errors suppressed")
-		}
-	}()
+	go p.runExitLookup(member, used)
 }
 
 func (p *poolOutbound) enrichExit(member *memberState, used bool) {
 	if p.monitor != nil && member.entry != nil {
 		p.monitor.EnrichExit(p.ctx, member.entry, used)
+	}
+}
+
+func (p *poolOutbound) runExitLookup(member *memberState, used bool) {
+	entry := member.entry
+	failure := "canceled"
+	defer func() { entry.EndExitLookup(failure) }()
+	select {
+	case exitLookupGate <- struct{}{}:
+		defer func() { <-exitLookupGate }()
+	case <-p.ctx.Done():
+		return
+	}
+	if p.ctx.Err() != nil || !entry.ExitLookupHealthy() {
+		return
+	}
+	location, err := p.lookupExit(member)
+	if p.ctx.Err() != nil {
+		return
+	}
+	if err == nil {
+		failure = ""
+		entry.SetExit(location)
+		if p.monitor != nil {
+			if used {
+				p.monitor.RefreshExitMetadata(p.ctx, entry)
+			} else {
+				p.monitor.EnrichExit(p.ctx, entry, false)
+			}
+		}
+		return
+	}
+	failure = "failed"
+	if errors.Is(err, errExitProbeMismatch) {
+		entry.InvalidateExit()
+		failure = "mismatch"
+	} else if errors.Is(err, errExitProbeRateLimited) {
+		failure = "rate_limited"
+	}
+	if count := exitLookupErrors.Add(1); count <= 5 {
+		log.Printf("[pool] exit lookup failed for %s: %v", member.tag, err)
+	} else if count == 6 {
+		log.Printf("[pool] further exit lookup errors suppressed")
 	}
 }
 
@@ -122,7 +129,7 @@ func lookupExitFrom(ctx context.Context, client *http.Client, echoURL, locationU
 		return ipmeta.Location{}, fmt.Errorf("%w: IPify saw %s, location probe saw %q", errExitProbeMismatch, ip, location.IP)
 	}
 	location.IP = ip.String()
-	location.ISO = strings.ToUpper(location.ISO)
+	location.ISO = geoip.NormalizeCountryCode(location.ISO)
 	return location, nil
 }
 
@@ -133,11 +140,15 @@ func lookupExitLocation(ctx context.Context, client *http.Client, endpoint strin
 		Country string `json:"country_name"`
 		Org     string `json:"org"`
 		Error   bool   `json:"error"`
+		Reason  string `json:"reason"`
 	}
 	if err := readExitProbe(ctx, client, endpoint, &result); err != nil {
 		return ipmeta.Location{}, fmt.Errorf("ipapi.co exit probe: %w", err)
 	}
-	if result.Error || len(result.ISO) != 2 {
+	if result.Error || result.IP == "" {
+		if result.Error && strings.EqualFold(result.Reason, "RateLimited") {
+			return ipmeta.Location{}, fmt.Errorf("ipapi.co: %w", errExitProbeRateLimited)
+		}
 		return ipmeta.Location{}, fmt.Errorf("invalid ipapi.co location response")
 	}
 	return ipmeta.Location{IP: result.IP, ISO: result.ISO, Country: result.Country, Org: result.Org}, nil
@@ -153,6 +164,9 @@ func readExitProbe(ctx context.Context, client *http.Client, endpoint string, ds
 		return err
 	}
 	defer resp.Body.Close()
+	if resp.StatusCode == http.StatusTooManyRequests {
+		return fmt.Errorf("%w: HTTP 429", errExitProbeRateLimited)
+	}
 	if resp.StatusCode != http.StatusOK {
 		return fmt.Errorf("unexpected HTTP status %d", resp.StatusCode)
 	}

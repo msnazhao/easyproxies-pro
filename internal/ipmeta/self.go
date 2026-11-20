@@ -21,11 +21,14 @@ func (s *Service) Self(ctx context.Context, client *http.Client) (Location, erro
 		return result, err
 	}
 	ip, err := netip.ParseAddr(result.IP)
-	if err != nil || !ip.IsGlobalUnicast() || ip.IsPrivate() || len(result.ISO) != 2 || result.Org == "" {
+	if err != nil || !ip.IsGlobalUnicast() || ip.IsPrivate() {
 		return Location{}, fmt.Errorf("invalid IPinfo exit response")
 	}
-	s.mu.Lock()
-	s.locations[result.IP] = result
-	s.mu.Unlock()
+	result.IP = ip.Unmap().String()
+	if len(result.ISO) == 2 && result.Org != "" {
+		s.mu.Lock()
+		s.locations[result.IP] = result
+		s.mu.Unlock()
+	}
 	return result, nil
 }

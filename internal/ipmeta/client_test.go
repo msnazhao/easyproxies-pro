@@ -133,6 +133,29 @@ func TestSelfUsesProvidedNodeTransport(t *testing.T) {
 	}
 }
 
+func TestSelfAccessBlockDoesNotDisableKeyForOtherNodes(t *testing.T) {
+	var calls atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if calls.Add(1) == 1 {
+			w.WriteHeader(http.StatusForbidden)
+			return
+		}
+		fmt.Fprint(w, `{"ip":"8.8.8.8"}`)
+	}))
+	defer server.Close()
+	service := New()
+	defer service.Close()
+	service.InfoURL = server.URL + "/"
+	service.Configure(Config{IPinfoKeys: []string{"key"}})
+	if _, err := service.Self(context.Background(), server.Client()); err == nil {
+		t.Fatal("blocked IPinfo response was accepted")
+	}
+	result, err := service.Self(context.Background(), server.Client())
+	if err != nil || result.IP != "8.8.8.8" || calls.Load() != 2 {
+		t.Fatalf("another node could not use the same key: output=%+v err=%v calls=%d", result, err, calls.Load())
+	}
+}
+
 type roundTripFunc func(*http.Request) (*http.Response, error)
 
 func (f roundTripFunc) RoundTrip(r *http.Request) (*http.Response, error) { return f(r) }

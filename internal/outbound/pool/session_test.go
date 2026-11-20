@@ -164,7 +164,7 @@ func TestFastestSessionCountryFilter(t *testing.T) {
 		entry := mgr.Register(monitor.NodeInfo{Tag: member.tag})
 		entry.MarkInitialCheckDone(true)
 		entry.RecordSuccessWithLatency(time.Duration(i+1) * time.Millisecond)
-		entry.SetExit("8.8.8.8", strings.ToUpper(member.tag), member.tag, member.tag, "ISP")
+		entry.SetExit(ipmeta.Location{IP: "8.8.8.8", ISO: strings.ToUpper(member.tag), Country: member.tag, Org: "ISP"})
 		member.entry = entry
 	}
 	mustSessionTestDial(t, sessionTestContext(p, "account._fast1_gb_"), p, "gb")
@@ -174,6 +174,25 @@ func TestFastestSessionCountryFilter(t *testing.T) {
 	}
 	if got := p.sessionStore.List(); len(got) != 0 {
 		t.Fatal("country-filtered fastest route created a sticky binding")
+	}
+}
+
+func TestRegionalPoolExcludesUnclassifiedExits(t *testing.T) {
+	p := newSessionTestPool(nil, newSessionTestOutbound("unclassified"), newSessionTestOutbound("classified"))
+	p.options.Region = "other"
+	mgr, _ := monitor.NewManager(monitor.Config{})
+	defer mgr.Stop()
+	for _, member := range p.members {
+		member.entry = mgr.Register(monitor.NodeInfo{Tag: member.tag})
+		member.entry.MarkInitialCheckDone(true)
+	}
+	p.members[0].entry.SetExit(ipmeta.Location{IP: "8.8.8.8", ISO: "ZZ"})
+	p.members[1].entry.SetExit(ipmeta.Location{IP: "1.1.1.1", ISO: "AU"})
+	for _, identity := range []string{"", p.options.Metadata["unclassified"].Identity} {
+		member, err := p.pickMemberForSession(N.NetworkTCP, nil, identity)
+		if err != nil || member.tag != "classified" {
+			t.Fatalf("region routing selected %v, %v", member, err)
+		}
 	}
 }
 
@@ -267,7 +286,7 @@ func TestCountryPoolNeverFallsBackToServerCountry(t *testing.T) {
 		h := mgr.Register(monitor.NodeInfo{Tag: member.tag, EntryISO: "US", Region: "other"})
 		h.MarkInitialCheckDone(true)
 		if i == 1 {
-			h.SetExit("8.8.8.8", "US", "United States", "us", "ISP")
+			h.SetExit(ipmeta.Location{IP: "8.8.8.8", ISO: "US", Country: "United States", Org: "ISP"})
 		}
 		member.entry = h
 	}
