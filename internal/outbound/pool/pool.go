@@ -190,6 +190,10 @@ func newPool(ctx context.Context, _ adapter.Router, logger singlog.ContextLogger
 				entry.SetBlacklistFn(p.makeBlacklistByTagFunc(memberTag))
 				if probeFn := p.makeProbeByTagFunc(memberTag); probeFn != nil {
 					entry.SetProbe(probeFn)
+				} else {
+					// Without a probe target, allow scheduling as soon as the
+					// listener starts. No measured health result is recorded.
+					entry.MarkInitialCheckDone(true)
 				}
 			} else {
 				logger.Warn("failed to register node: ", memberTag)
