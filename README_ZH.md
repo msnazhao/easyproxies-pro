@@ -6,6 +6,15 @@
 
 目标是把大量上游节点统一成稳定的本地 HTTP/SOCKS5 代理入口，同时支持按节点独立端口访问。
 
+## v26.11.20
+
+- 使用 `用户名._ip_…` 指定已验证的 IPv4 或 IPv6 出口。重试始终限定在同一出口 IP。
+- 使用 `用户名._fast1_isp_` 选择 AbuseIPDB 已知评分最低的健康 ISP 节点，同分按实测延迟排序。
+- 使用免认证的 `/sub/proxies2` 获取 SOCKS5 中转订阅。每个近期验证过的健康出口 IP 只保留一条链接，链接中包含主代理入口凭据。
+- 周期健康检查只覆盖活跃节点，出口复核在后台运行，AbuseIPDB 评分按出口 IP 缓存。
+
+固定版本镜像为 `ghcr.io/msnazhao/easyproxies-pro:26.11.20`。发布页提供 Linux amd64 和 arm64 二进制。 [GitHub 发布](https://github.com/msnazhao/easyproxies-pro/releases/tag/v26.11.20) · [更新日志](CHANGELOG.md#261120---2026-11-20)
+
 ## 当前能力
 
 - 运行模式：`pool`、`multi-port`、`hybrid`。
@@ -56,7 +65,7 @@ Docker 默认挂载 **`./data`** 目录，实际读取的是 `data/config.yaml`�
 docker compose up -d
 ```
 
-本地运行（需 **Go 1.26.10 或更新版本**，Docker builder 固定为 Go 1.26.10）：
+本地运行需要 **Go 1.26.11 或更新版本**。Docker builder 固定为 Go 1.26.11。
 
 ```bash
 go run ./cmd/easy_proxies -config config.yaml
@@ -87,7 +96,7 @@ docker compose pull easy_proxies
 docker compose up -d --force-recreate easy_proxies
 ```
 
-重建容器会清空内存中的命名会话，已保存的节点端口仍保留。修改管理密码立即生效，需要重新登录。推荐目录挂载以获得配置原子替换；单文件 bind mount 继续使用锁内原地写兼容路径，但不具备相同的断电/崩溃原子性保障。源码构建需 Go 1.26.10+；可选协议/流量统计还需完整生产标签。
+重建容器会清空内存中的命名会话，已保存的节点端口仍保留。修改管理密码立即生效，需要重新登录。推荐目录挂载以获得配置原子替换；单文件 bind mount 继续使用锁内原地写兼容路径，但不具备相同的断电/崩溃原子性保障。源码构建需 Go 1.26.11+；可选协议/流量统计还需完整生产标签。
 
 ## 最小配置示例（Pool）
 
@@ -351,6 +360,7 @@ Clash 订阅中的非法 YAML 控制字符会按节点隔离：显示名称可�
 - `POST /api/nodes/probe-all`（SSE）
 - `GET /api/export`（默认导出健康节点，`all=true` 导出全部；`scheme=http/socks5/all`）
 - `GET /sub/proxies?c=US&f=sing-box`（按实测出口国家导出已检测的节点；`f=v2ray` 为默认值）
+- `GET /sub/proxies2`（免认证 SOCKS5 中转订阅，每个已验证的出口 IP 对应一条链接）
 - `GET|PUT /api/subscription/config`
 - `GET|POST /api/subscription/status|refresh`
 - `GET|POST|PUT|DELETE /api/nodes/config[...]`
@@ -453,7 +463,7 @@ docker run --user $(id -u):$(id -g) \
   -v $(pwd)/data:/etc/easy_proxies \
   -v $(pwd)/logs:/app/logs \
   --network host \
-  ghcr.io/jasonwong1991/easy_proxies:latest
+  ghcr.io/msnazhao/easyproxies-pro:latest
 ```
 
 ### 其他常见问题
@@ -486,7 +496,7 @@ docker run --user $(id -u):$(id -g) \
 
 ## 开发验证
 
-使用 **Go 1.26.10 或更新版本**（以 `go.mod` 为准），fixture 测试使用 Node.js 24；Docker builder 固定为 Go 1.26.10。发布工作流要求以下检查通过后才构建/发布镜像，实际运行结果以 GitHub Actions 为准：
+使用 **Go 1.26.11 或更新版本**（以 `go.mod` 为准），fixture 测试使用 Node.js 24。Docker builder 固定为 Go 1.26.11。GitHub Actions 在发布镜像前运行以下检查。
 
 ```bash
 go test -count=1 ./...

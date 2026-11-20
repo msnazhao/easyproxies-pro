@@ -13,7 +13,7 @@ jobs:
     timeout-minutes: 30
     env:
       FEATURE_TAGS: with_utls with_quic with_grpc with_wireguard with_gvisor with_clash_api
-      VERSION: 26.11.17
+      VERSION: 26.11.20
     steps:
       - uses: actions/checkout@v7
         with:

@@ -7,8 +7,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [26.11.20] - 2026-11-20
+
+### Added
+
+- Route main-port sessions to a specified IPv4 or IPv6 exit with `username._ip_…`. Choose the lowest-latency eligible node, retry each candidate at most once within a shared 10-second dial budget, and keep all attempts within the requested IP.
+- Add `username._fast1_isp_` to select a healthy fixed-line or mobile ISP with the lowest known AbuseIPDB score. Use measured latency to break ties.
+- Add the public `/sub/proxies2` endpoint for line-delimited SOCKS5 relay links. Keep one link per verified exit IP using the display name of the lowest-latency matching node. Links contain the configured proxy listener credentials.
+
+### Changed
+
+- Run periodic health checks for nodes with active proxy connections. Reverify aging exit IPs in the background and share AbuseIPDB scores by exit IP for 24 hours.
+- Require a successful health probe for both subscription exports. The SOCKS5 relay export also requires health and exit IP confirmation from the last 30 minutes.
+
 ### Fixed
-- Remove ipwho.is from exit discovery. Prefer IPinfo Lite and cross-check with IPify; without a usable IPinfo key, use IPify and cross-check with ipapi.co.
+
+- Confirm the exit IP with IPinfo Lite and IPify, or with IPify and ipapi.co when a usable IPinfo key is unavailable. Withdraw conflicting exit observations and discard metadata results for previous addresses.
+- Restore pool availability immediately after configuration rollback when no health probe is configured.
 
 ## [26.11.17] - 2026-11-17
 

@@ -6,6 +6,15 @@
 
 `easyproxies-pro` is a community fork of [jasonwong1991/easy_proxies](https://github.com/jasonwong1991/easy_proxies), with additional routing, subscription export, and Linux binary build improvements.
 
+## v26.11.20
+
+- Select a verified exit IP with `username._ip_…`. Retries stay within the requested IP.
+- Use `username._fast1_isp_` to select the eligible ISP exit with the lowest known AbuseIPDB score. Ties go to the lowest measured latency.
+- Fetch one SOCKS5 relay link per healthy, recently verified exit IP from `/sub/proxies2`. The public endpoint includes the proxy listener credentials in each link.
+- Periodic health checks focus on nodes with active connections. Exit verification and AbuseIPDB refresh reuse background checks and cached results.
+
+The versioned image is `ghcr.io/msnazhao/easyproxies-pro:26.11.20`. Linux amd64 and arm64 binaries are available on the release page. [GitHub release](https://github.com/msnazhao/easyproxies-pro/releases/tag/v26.11.20) · [Changelog](CHANGELOG.md#261120---2026-11-20)
+
 ## Features
 
 - **Three runtime modes**: `pool` (single-port load balancing), `multi-port` (one port per node), and `hybrid` (both simultaneously)
@@ -47,7 +56,7 @@ docker run --user $(id -u):$(id -g) \
   -v $(pwd)/data:/etc/easy_proxies \
   -v $(pwd)/logs:/app/logs \
   --network host \
-  ghcr.io/jasonwong1991/easy_proxies:latest
+  ghcr.io/msnazhao/easyproxies-pro:latest
 ```
 
 Or use docker compose:
@@ -57,7 +66,7 @@ docker compose up -d
 
 ### 3. Run from Source
 
-Use **Go 1.26.10 or newer**; the Docker builder is pinned to Go 1.26.10.
+Use **Go 1.26.11 or newer**. The Docker builder is pinned to Go 1.26.11.
 
 ```bash
 go run ./cmd/easy_proxies --config config.yaml
@@ -92,7 +101,7 @@ docker compose pull easy_proxies
 docker compose up -d --force-recreate easy_proxies
 ```
 
-Recreating the container clears in-memory named sessions, but saved per-node ports survive. A management password change takes effect immediately and requires a new login. Directory mounts provide atomic configuration replacement; individual-file bind mounts remain compatible through a locked in-place fallback, without the same crash/power-loss atomicity guarantees. Source builds need Go 1.26.10+ and the production feature tags for optional protocols/traffic statistics.
+Recreating the container clears in-memory named sessions, but saved per-node ports survive. A management password change takes effect immediately and requires a new login. Directory mounts provide atomic configuration replacement; individual-file bind mounts remain compatible through a locked in-place fallback, without the same crash/power-loss atomicity guarantees. Source builds need Go 1.26.11+ and the production feature tags for optional protocols/traffic statistics.
 
 ## Configuration
 
@@ -403,6 +412,7 @@ Changing the management password takes effect immediately and invalidates existi
 | `/api/nodes/probe-all` | POST | Probe all nodes (SSE stream) |
 | `/api/export` | GET | Export local proxy URLs; healthy nodes by default, `all=true` for all nodes, `scheme=http/socks5/all` |
 | `/sub/proxies` | GET | Tested nodes by exit country (`c=US`); `f=v2ray` (default) or `f=sing-box` |
+| `/sub/proxies2` | GET | Public SOCKS5 relay links, one per verified exit IP |
 | `/api/subscription/config` | GET, PUT | Manage subscription URLs |
 | `/api/subscription/status` | GET | Check subscription status |
 | `/api/subscription/refresh` | POST | Trigger manual refresh |
@@ -423,7 +433,7 @@ The default setup uses host networking (recommended for automatic port managemen
 ```yaml
 services:
   easy_proxies:
-    image: ghcr.io/jasonwong1991/easy_proxies:latest
+    image: ghcr.io/msnazhao/easyproxies-pro:latest
     container_name: easy_proxies
     restart: unless-stopped
     network_mode: host
@@ -531,7 +541,7 @@ docker run --user $(id -u):$(id -g) \
   -v $(pwd)/data:/etc/easy_proxies \
   -v $(pwd)/logs:/app/logs \
   --network host \
-  ghcr.io/jasonwong1991/easy_proxies:latest
+  ghcr.io/msnazhao/easyproxies-pro:latest
 ```
 
 ### Other Common Issues
@@ -564,7 +574,7 @@ See [CHANGELOG.md](CHANGELOG.md) for version history.
 
 ## Development
 
-Use **Go 1.26.10 or newer** (see `go.mod`) and Node.js 24 for fixture tests. The Docker builder is pinned to Go 1.26.10. The publication workflow requires the checks below before building/publishing images; actual run results are recorded in GitHub Actions:
+Use **Go 1.26.11 or newer** (see `go.mod`) and Node.js 24 for fixture tests. The Docker builder is pinned to Go 1.26.11. GitHub Actions runs the following checks before publishing images.
 
 ```bash
 go test -count=1 ./...
