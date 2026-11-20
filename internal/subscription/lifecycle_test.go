@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"easy_proxies/internal/config"
+	"easy_proxies/internal/monitor"
 )
 
 type quietLogger struct{}
@@ -27,7 +28,10 @@ type fakeRuntime struct {
 	cfg       *config.Config
 	reloads   int
 	reloadErr error
+	health    *monitor.Manager
 }
+
+func (f *fakeRuntime) MonitorManager() *monitor.Manager { return f.health }
 
 func (f *fakeRuntime) CurrentConfig() *config.Config {
 	f.mu.Lock()
@@ -69,6 +73,128 @@ func testManager(t *testing.T, urls []string, enabled bool) (*Manager, *fakeRunt
 	m.boxMgr = runtime
 	t.Cleanup(m.Stop)
 	return m, runtime
+}
+
+func TestRefreshArchivesHealthyOrphansAndLoadsThemAfterRestart(t *testing.T) {
+	const incoming = "trojan://pw@new.example:443#new"
+	const dead = "trojan://pw@dead.example:443#dead"
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte(incoming))
+	}))
+	defer server.Close()
+	m, runtime := testManager(t, []string{server.URL}, false)
+	old := runtime.cfg.Nodes[0]
+	runtime.cfg.Nodes = append(runtime.cfg.Nodes, config.NodeConfig{URI: dead, Source: config.NodeSourceSubscription})
+	health, err := monitor.NewManager(monitor.Config{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer health.Stop()
+	runtime.health = health
+	h := health.Register(monitor.NodeInfo{Tag: "old", URI: strings.Replace(old.URI, "#old", "#renamed", 1)})
+	h.MarkInitialCheckDone(true)
+	h.RecordSuccessWithLatency(time.Millisecond)
+	deadEntry := health.Register(monitor.NodeInfo{Tag: "dead", URI: dead})
+	deadEntry.RecordSuccessWithLatency(time.Millisecond)
+	deadEntry.MarkInitialCheckDone(false)
+	if err := m.RefreshNow(); err != nil {
+		t.Fatal(err)
+	}
+	current := runtime.CurrentConfig()
+	if len(current.Nodes) != 2 || current.Nodes[0].URI != incoming || current.Nodes[1].Source != config.NodeSourceRetained || current.Nodes[1].URI != old.URI {
+		t.Fatalf("unexpected refresh result: %+v", current.Nodes)
+	}
+	retained, err := config.LoadNodesFromFile(current.RetainedNodesPath())
+	if err != nil || len(retained) != 1 || retained[0].URI != old.URI {
+		t.Fatalf("retained file has %d nodes, error %v", len(retained), err)
+	}
+	if err := m.UpdateConfigAndRefresh(nil, false, time.Hour); err != nil {
+		t.Fatal(err)
+	}
+	current = runtime.CurrentConfig()
+	if len(current.Nodes) != 1 || current.Nodes[0].Source != config.NodeSourceRetained {
+		t.Fatalf("unexpected nodes after deleting the last subscription: %+v", current.Nodes)
+	}
+	if cache, err := os.ReadFile(current.NodesFile); err != nil || len(cache) != 0 {
+		t.Fatalf("old subscription cache was not cleared: %d bytes, %v", len(cache), err)
+	}
+	restarted, err := config.Load(current.FilePath())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(restarted.Nodes) != 1 || restarted.Nodes[0].Source != config.NodeSourceRetained || restarted.Nodes[0].URI != old.URI {
+		t.Fatalf("retained node did not survive restart: %+v", restarted.Nodes)
+	}
+}
+
+func TestEmptySubscriptionSettingsLeaveLocalNodeFileAlone(t *testing.T) {
+	m, runtime := testManager(t, nil, false)
+	runtime.cfg.Nodes[0].Source = config.NodeSourceFile
+	if err := m.UpdateConfigAndRefresh(nil, false, time.Hour); err != nil {
+		t.Fatal(err)
+	}
+	current := runtime.CurrentConfig()
+	if len(current.Nodes) != 1 || current.Nodes[0].Source != config.NodeSourceFile || runtime.reloads != 0 {
+		t.Fatalf("updating empty subscriptions changed local nodes: %+v", current.Nodes)
+	}
+	cache, err := os.ReadFile(current.NodesFile)
+	if err != nil || strings.TrimSpace(string(cache)) != current.Nodes[0].URI {
+		t.Fatalf("local source was overwritten, read error %v", err)
+	}
+}
+
+func TestRefreshPrunesBlacklistedAndUnavailableRetainedNodes(t *testing.T) {
+	const incoming = "trojan://pw@new.example:443#new"
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte(incoming))
+	}))
+	defer server.Close()
+	m, runtime := testManager(t, []string{server.URL}, false)
+	health, err := monitor.NewManager(monitor.Config{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer health.Stop()
+	runtime.health = health
+	runtime.cfg.Nodes = nil
+	entries := make(map[string]*monitor.EntryHandle)
+	for _, name := range []string{"blacklisted", "unavailable", "healthy", "checking"} {
+		uri := "trojan://pw@" + name + ".example:443#" + name
+		runtime.cfg.Nodes = append(runtime.cfg.Nodes, config.NodeConfig{Name: name, URI: uri, Source: config.NodeSourceSubscription})
+		entry := health.Register(monitor.NodeInfo{Tag: name, URI: uri})
+		entry.MarkInitialCheckDone(true)
+		entry.RecordSuccessWithLatency(time.Millisecond)
+		entries[name] = entry
+	}
+	if err := m.RefreshNow(); err != nil {
+		t.Fatal(err)
+	}
+	current := runtime.CurrentConfig()
+	retained, err := config.LoadNodesFromFile(current.RetainedNodesPath())
+	if err != nil || len(retained) != 4 {
+		t.Fatalf("initial refresh retained %d nodes, error %v", len(retained), err)
+	}
+	entries["blacklisted"].Blacklist(time.Now().Add(time.Hour))
+	entries["unavailable"].MarkAvailable(false)
+	// A reloaded node may still be waiting for its first health result.
+	health.Register(monitor.NodeInfo{Tag: "checking", URI: "trojan://pw@different.example:443"})
+	health.Register(monitor.NodeInfo{Tag: "checking", URI: "trojan://pw@checking.example:443#checking"})
+	if err := m.RefreshNow(); err != nil {
+		t.Fatal(err)
+	}
+	current = runtime.CurrentConfig()
+	if len(current.Nodes) != 3 || current.Nodes[0].URI != incoming {
+		t.Fatalf("unexpected refreshed nodes: %+v", current.Nodes)
+	}
+	retained, err = config.LoadNodesFromFile(current.RetainedNodesPath())
+	if err != nil || len(retained) != 2 {
+		t.Fatalf("subsequent refresh retained %d nodes, error %v", len(retained), err)
+	}
+	for i, name := range []string{"healthy", "checking"} {
+		if current.Nodes[i+1].Name != name || current.Nodes[i+1].Source != config.NodeSourceRetained || retained[i].URI != current.Nodes[i+1].URI {
+			t.Fatalf("expected %s in the pool and retained file", name)
+		}
+	}
 }
 
 func TestManualRefreshWorksWhenPeriodicDisabled(t *testing.T) {

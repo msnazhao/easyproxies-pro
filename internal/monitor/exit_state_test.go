@@ -35,7 +35,7 @@ func TestExitLookupRunsOnceUntilReload(t *testing.T) {
 	}
 }
 
-func TestExitRouteRequiresRecentHealthAndExitConfirmation(t *testing.T) {
+func TestIdleExitRemainsCandidateButRequiresFreshIPForDial(t *testing.T) {
 	m, _ := NewManager(Config{})
 	defer m.Stop()
 	h := m.Register(NodeInfo{Tag: "a", Name: "Original"})
@@ -50,18 +50,24 @@ func TestExitRouteRequiresRecentHealthAndExitConfirmation(t *testing.T) {
 	h.ref.lastProbeAt = time.Now().Add(-exitRoutingTTL)
 	h.ref.mu.Unlock()
 	h.RecordSuccess()
-	if h.ExitRouteLatency(ip, time.Now()) != 0 {
-		t.Fatal("traffic success revived an expired probe")
+	if h.ExitRouteLatency(ip, time.Now()) == 0 {
+		t.Fatal("idle health measurement hid a still-verified exit")
 	}
 	h.RecordSuccessWithLatency(time.Millisecond)
 	h.ref.mu.Lock()
 	h.ref.exitVerifiedAt = time.Now().Add(-exitRoutingTTL)
 	h.ref.mu.Unlock()
-	if h.ExitRouteLatency(ip, time.Now()) != 0 || !h.BeginExitLookup(true) {
-		t.Fatal("expired exit was eligible or could not be refreshed")
+	if h.ExitCandidateLatency(ip, time.Now()) == 0 || h.ExitRouteLatency(ip, time.Now()) != 0 {
+		t.Fatal("stale exit did not require verification before use")
+	}
+	done, start := h.QueueExitLookup(true)
+	shared, duplicate := h.QueueExitLookup(true)
+	if !start || duplicate || done == nil || done != shared {
+		t.Fatal("concurrent traffic did not share the stale-exit verification")
 	}
 	h.SetExit(ipmeta.Location{IP: "1.1.1.1", ISO: "AU"})
 	h.EndExitLookup("")
+	<-done
 	if got := m.Snapshot()[0]; got.OriginalName != "Original" || got.ExitIP != "1.1.1.1" {
 		t.Fatalf("IP refresh changed identity or failed to publish new address: %+v", got)
 	}

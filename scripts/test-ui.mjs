@@ -39,6 +39,17 @@ test('relay search matches exit code and route; exit IP has its own cell',async(
  assert.match(f.element('nodesTableBody').innerHTML,/<td[^>]*>8\.8\.8\.8<\/td>/);
 });
 
+test('ZZ exits appear under unknown regions',async()=>{
+ const f=await fixture();
+ f.context.fixtureNodes=[{tag:'unknown-country',country_code:'ZZ',exit_ip:'8.8.8.8'}, {tag:'other-country',country_code:'AU',region:'other',exit_ip:'1.1.1.1'}];
+ f.run('allNodesCache=fixtureNodes; currentRegionFilter="unknown"; applyNodeFilters(true)');
+ assert.equal(rows(f.element('nodesTableBody')),1);
+ assert.match(f.element('nodesTableBody').innerHTML,/8\.8\.8\.8/);
+ f.run('currentRegionFilter="other"; applyNodeFilters(true)');
+ assert.equal(rows(f.element('nodesTableBody')),1);
+ assert.match(f.element('nodesTableBody').innerHTML,/1\.1\.1\.1/);
+});
+
 test('10k config and diagnostics render only 300 rows; timeline is bounded',async()=>{
  const f=await fixture(); f.context.fixtureNodes=nodes(); f.run('configNodes=fixtureNodes; window._debugNodes=fixtureNodes; renderConfigNodes(); renderDebugNodes();');
  assert.equal(rows(f.element('configNodesTableBody')),300); assert.equal(rows(f.element('debugNodesTableBody')),300); assert.equal((f.element('debugNodesTableBody').innerHTML.match(/tl-dot /g)||[]).length,9000);

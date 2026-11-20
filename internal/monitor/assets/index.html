@@ -682,7 +682,7 @@
           <button class="region-btn" data-region="fr" onclick="filterByRegion('fr')">FR</button>
           <button class="region-btn" data-region="tr" onclick="filterByRegion('tr')">TR</button>
           <button class="region-btn" data-region="other" onclick="filterByRegion('other')">其他</button>
-          <button class="region-btn" data-region="unknown" onclick="filterByRegion('unknown')">未知出口</button>
+          <button class="region-btn" data-region="unknown" onclick="filterByRegion('unknown')">地区未知</button>
         </div>
 
         <div class="filter-toolbar">
@@ -1463,7 +1463,7 @@
       // 1. Region Chart Data
       const regionStats = {};
       allNodesCache.forEach(n => {
-        const r = (n.exit_ip ? (n.region || 'other') : 'unknown').toUpperCase();
+        const r = (n.exit_ip && n.region ? n.region : 'unknown').toUpperCase();
         if(!regionStats[r]) regionStats[r] = { total: 0, healthy: 0 };
         regionStats[r].total++;
         if(!n.blacklisted && n.initial_check_done && n.available) {
@@ -1627,7 +1627,7 @@
     function applyNodeFilters(resetLimit=false) {
       if(resetLimit) nodeRenderLimit=300;
       const query=document.getElementById('nodeSearch').value.trim().toLowerCase(),status=document.getElementById('nodeStatusFilter').value;
-      const nodes=allNodesCache.filter(n => (currentRegionFilter === 'all' || (n.exit_ip ? (n.region||'other') : 'unknown') === currentRegionFilter) && (status === 'all' || nodeStatus(n) === status) && (!query || [n.name,n.tag,n.region,n.country,n.country_code,n.provider,n.exit_ip,n.entry_country,n.entry_iso,`${n.entry_iso || ''}->${n.country_code || ''}`,`${n.entry_iso || ''} → ${n.country_code || ''}`].some(v => String(v || '').toLowerCase().includes(query))));
+      const nodes=allNodesCache.filter(n => (currentRegionFilter === 'all' || (n.exit_ip && n.region ? n.region : 'unknown') === currentRegionFilter) && (status === 'all' || nodeStatus(n) === status) && (!query || [n.name,n.tag,n.region,n.country,n.country_code,n.provider,n.exit_ip,n.entry_country,n.entry_iso,`${n.entry_iso || ''}->${n.country_code || ''}`,`${n.entry_iso || ''} → ${n.country_code || ''}`].some(v => String(v || '').toLowerCase().includes(query))));
       const sort=document.getElementById('nodeSort').value;
       if (sort === 'latency') nodes.sort((a,b) => (nodeStatus(a)==='healthy' ? (a.last_latency_ms>=0 ? a.last_latency_ms : Infinity) : Infinity)-(nodeStatus(b)==='healthy' ? (b.last_latency_ms>=0 ? b.last_latency_ms : Infinity) : Infinity));
       else if (sort === 'connections') nodes.sort((a,b) => (b.active_connections||0)-(a.active_connections||0));

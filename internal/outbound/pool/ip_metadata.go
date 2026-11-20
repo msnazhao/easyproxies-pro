@@ -23,15 +23,16 @@ import (
 var errExitProbeMismatch = errors.New("exit probes disagree")
 var errExitProbeRateLimited = errors.New("exit probe rate limited")
 
-func (p *poolOutbound) scheduleExitLookup(member *memberState, used bool) {
+func (p *poolOutbound) scheduleExitLookup(member *memberState, used bool) <-chan struct{} {
 	entry := member.entry
 	if entry == nil || p.ctx.Err() != nil {
-		return
+		return nil
 	}
-	if !entry.BeginExitLookup(used) {
-		return
+	done, start := entry.QueueExitLookup(used)
+	if start {
+		go p.runExitLookup(member, used)
 	}
-	go p.runExitLookup(member, used)
+	return done
 }
 
 func (p *poolOutbound) enrichExit(member *memberState, used bool) {

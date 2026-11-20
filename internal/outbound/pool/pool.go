@@ -373,7 +373,11 @@ func (p *poolOutbound) DialContext(ctx context.Context, network string, destinat
 			return nil, err
 		}
 		p.incActive(member)
-		conn, dialErr := member.outbound.DialContext(ctx, network, destination)
+		var conn net.Conn
+		dialErr := p.verifyExitForDial(ctx, member, exitIP)
+		if dialErr == nil {
+			conn, dialErr = member.outbound.DialContext(ctx, network, destination)
+		}
 		dialErr = checkDialedExit(conn, dialErr, member, exitIP)
 		if dialErr != nil {
 			p.decActive(member)
@@ -483,7 +487,11 @@ func (p *poolOutbound) ListenPacket(ctx context.Context, destination M.Socksaddr
 			return nil, err
 		}
 		p.incActive(member)
-		conn, listenErr := member.outbound.ListenPacket(ctx, destination)
+		var conn net.PacketConn
+		listenErr := p.verifyExitForDial(ctx, member, exitIP)
+		if listenErr == nil {
+			conn, listenErr = member.outbound.ListenPacket(ctx, destination)
+		}
 		listenErr = checkDialedExit(conn, listenErr, member, exitIP)
 		if listenErr != nil {
 			p.decActive(member)

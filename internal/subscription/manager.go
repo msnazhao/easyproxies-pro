@@ -49,10 +49,15 @@ type subscriptionConfigRuntime interface {
 	CurrentSubscriptionConfig() *config.Config
 }
 
+type monitoredRuntime interface {
+	MonitorManager() *monitor.Manager
+}
+
 type refreshCall struct {
-	done    chan struct{}
-	version uint64
-	err     error // Published by closing done.
+	done       chan struct{}
+	version    uint64
+	allowEmpty bool
+	err        error // Published by closing done.
 }
 
 // Manager owns one worker and one immutable lifetime context. Disabling the
@@ -206,9 +211,7 @@ func (m *Manager) UpdateConfig(urls []string, enabled bool, interval time.Durati
 		return
 	}
 	m.Start()
-	if len(urls) > 0 {
-		_, _ = m.requestRefresh()
-	}
+	_, _ = m.requestRefreshWithEmptyList(true)
 }
 
 func (m *Manager) UpdateConfigAndRefresh(urls []string, enabled bool, interval time.Duration) error {
@@ -222,15 +225,16 @@ func (m *Manager) UpdateConfigAndRefreshContext(ctx context.Context, urls []stri
 		return err
 	}
 	m.Start()
-	if len(urls) == 0 {
-		return nil
-	}
-	return m.RefreshNowContext(ctx)
+	return m.refreshNowContext(ctx, true)
 }
 
 func (m *Manager) RefreshNow() error { return m.RefreshNowContext(context.Background()) }
 
 func (m *Manager) requestRefresh() (*refreshCall, error) {
+	return m.requestRefreshWithEmptyList(false)
+}
+
+func (m *Manager) requestRefreshWithEmptyList(allowEmpty bool) (*refreshCall, error) {
 	m.Start()
 	m.syncRuntimeConfig()
 	m.mu.Lock()
@@ -238,32 +242,37 @@ func (m *Manager) requestRefresh() (*refreshCall, error) {
 	if m.stopped {
 		return nil, errors.New("subscription manager stopped")
 	}
-	if len(m.baseCfg.Subscriptions) == 0 {
+	if len(m.baseCfg.Subscriptions) == 0 && !allowEmpty {
 		return nil, errors.New("no subscription URLs configured")
 	}
 	if m.pending != nil {
 		// An unstarted refresh always uses the latest settings, so rapid edits
 		// collapse into one follow-up refresh rather than an unbounded queue.
 		m.pending.version = m.version
+		m.pending.allowEmpty = m.pending.allowEmpty || allowEmpty
 		return m.pending, nil
 	}
 	if m.active != nil && m.active.version == m.version {
 		return m.active, nil
 	}
-	call := &refreshCall{done: make(chan struct{}), version: m.version}
+	call := &refreshCall{done: make(chan struct{}), version: m.version, allowEmpty: allowEmpty}
 	m.pending = call
 	m.requests <- call // One pending call; the channel is necessarily empty.
 	return call, nil
 }
 
 func (m *Manager) RefreshNowContext(ctx context.Context) error {
+	return m.refreshNowContext(ctx, false)
+}
+
+func (m *Manager) refreshNowContext(ctx context.Context, allowEmpty bool) error {
 	if ctx == nil {
 		ctx = context.Background()
 	}
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	call, err := m.requestRefresh()
+	call, err := m.requestRefreshWithEmptyList(allowEmpty)
 	if err != nil {
 		return err
 	}
@@ -285,7 +294,7 @@ func (m *Manager) RefreshNowContext(ctx context.Context) error {
 	// Fetch timeout is per URL, not for the entire batch. Account for queued
 	// batches and core validation/draining rather than timing out prematurely.
 	batches := (urls + concurrency - 1) / concurrency
-	waitCtx, cancel := context.WithTimeout(ctx, time.Duration(batches)*timeout+refresh.HealthCheckTimeout+refresh.DrainTimeout)
+	waitCtx, cancel := context.WithTimeout(ctx, time.Duration(max(1, batches))*timeout+refresh.HealthCheckTimeout+refresh.DrainTimeout)
 	defer cancel()
 	select {
 	case <-call.done:
@@ -380,7 +389,12 @@ func (m *Manager) refreshLoop() {
 			cfg := cloneConfig(m.baseCfg)
 			m.status.IsRefreshing = true
 			m.mu.Unlock()
-			err := m.doRefresh(cfg, call.version)
+			var err error
+			if len(cfg.Subscriptions) == 0 && !call.allowEmpty {
+				err = errors.New("no subscription URLs configured")
+			} else {
+				err = m.doRefresh(cfg, call.version)
+			}
 			m.mu.Lock()
 			m.status.IsRefreshing = false
 			m.status.RefreshCount++
@@ -409,11 +423,16 @@ func (m *Manager) doRefresh(cfg *config.Config, version uint64) error {
 	if m.boxMgr != nil {
 		startingConfig = m.boxMgr.CurrentConfig()
 	}
+	if len(cfg.Subscriptions) == 0 && startingConfig != nil && !slices.ContainsFunc(startingConfig.Nodes, func(node config.NodeConfig) bool {
+		return node.Source == config.NodeSourceSubscription
+	}) {
+		return nil
+	}
 	nodes, err := m.fetchSubscriptions(cfg)
 	if err != nil {
 		return err
 	}
-	if len(nodes) == 0 {
+	if len(nodes) == 0 && len(cfg.Subscriptions) != 0 {
 		return errors.New("no nodes fetched from subscriptions")
 	}
 	if err := m.ctx.Err(); err != nil {
@@ -429,7 +448,20 @@ func (m *Manager) doRefresh(cfg *config.Config, version uint64) error {
 		return errors.New("proxy runtime is not initialized")
 	}
 
+	var health *monitor.Manager
+	if runtime, ok := m.boxMgr.(monitoredRuntime); ok {
+		health = runtime.MonitorManager()
+	}
 	var nodesFile string
+	buildCandidate := func(current *config.Config) (*config.Config, error) {
+		candidate := createConfig(current, nodes, nodeAvailabilityByKey(health))
+		if len(candidate.Nodes) == 0 {
+			return nil, errors.New("no healthy or local nodes remain after removing subscriptions")
+		}
+		candidate.Subscriptions = append([]string(nil), cfg.Subscriptions...)
+		candidate.SubscriptionRefresh = cfg.SubscriptionRefresh
+		return candidate, nil
+	}
 	if runtime, ok := m.boxMgr.(transactionalRuntime); ok {
 		err := runtime.ReloadWithCurrentConfig(func(current *config.Config) error {
 			if err := m.ctx.Err(); err != nil {
@@ -447,14 +479,15 @@ func (m *Manager) doRefresh(cfg *config.Config, version uint64) error {
 			if !sameSubscriptionConfig(current, cfg) && !sameSubscriptionConfig(current, startingConfig) {
 				return errors.New("subscription configuration changed during refresh; preserving newly published settings")
 			}
-			candidate := createConfig(current, nodes)
-			candidate.Subscriptions = append([]string(nil), cfg.Subscriptions...)
-			candidate.SubscriptionRefresh = cfg.SubscriptionRefresh
+			candidate, err := buildCandidate(current)
+			if err != nil {
+				return err
+			}
 			*current = *candidate
 			return nil
 		}, func(candidate *config.Config) error {
 			nodesFile = nodesFilePath(candidate)
-			return m.writeNodesToFile(nodesFile, nodes)
+			return candidate.SaveSubscriptionSources(nodesFile, nodes)
 		})
 		if err != nil {
 			return fmt.Errorf("refresh transaction: %w", err)
@@ -472,15 +505,16 @@ func (m *Manager) doRefresh(cfg *config.Config, version uint64) error {
 	if !sameSubscriptionConfig(oldCfg, cfg) && !sameSubscriptionConfig(oldCfg, startingConfig) {
 		return errors.New("subscription configuration changed during refresh; preserving newly published settings")
 	}
-	newCfg := createConfig(oldCfg, nodes)
-	newCfg.Subscriptions = append([]string(nil), cfg.Subscriptions...)
-	newCfg.SubscriptionRefresh = cfg.SubscriptionRefresh
+	newCfg, err := buildCandidate(oldCfg)
+	if err != nil {
+		return err
+	}
 	portMap := oldCfg.BuildPortMap()
 	if err := m.boxMgr.ReloadWithPortMap(newCfg, portMap); err != nil {
 		return fmt.Errorf("reload: %w", err)
 	}
 	nodesFile = nodesFilePath(newCfg)
-	if err := m.writeNodesToFile(nodesFile, nodes); err != nil {
+	if err := newCfg.SaveSubscriptionSources(nodesFile, nodes); err != nil {
 		rollbackErr := m.boxMgr.ReloadWithPortMap(oldCfg, portMap)
 		if rollbackErr != nil {
 			return fmt.Errorf("persist subscription cache: %w; runtime rollback failed: %v", err, rollbackErr)
@@ -571,10 +605,6 @@ func (m *Manager) getNodesFilePath() string {
 	return nodesFilePath(m.baseCfg)
 }
 
-func (m *Manager) writeNodesToFile(path string, nodes []config.NodeConfig) error {
-	return config.WriteNodesToFile(path, nodes)
-}
-
 func (m *Manager) computeNodesHash(nodes []config.NodeConfig) string {
 	uris := make([]string, 0, len(nodes))
 	for _, node := range nodes {
@@ -645,20 +675,65 @@ func (m *Manager) createNewConfig(nodes []config.NodeConfig) *config.Config {
 	m.mu.RLock()
 	base := cloneConfig(m.baseCfg)
 	m.mu.RUnlock()
-	return createConfig(base, nodes)
+	return createConfig(base, nodes, nil)
 }
 
-func createConfig(base *config.Config, nodes []config.NodeConfig) *config.Config {
+type nodeAvailability uint8
+
+const (
+	nodeUnchecked nodeAvailability = iota
+	nodeUnavailable
+	nodeHealthy
+)
+
+func nodeAvailabilityByKey(health *monitor.Manager) map[string]nodeAvailability {
+	if health == nil {
+		return nil
+	}
+	availability := make(map[string]nodeAvailability)
+	for _, node := range health.SnapshotFiltered(false) {
+		if node.URI == "" {
+			continue
+		}
+		status := nodeUnchecked
+		switch {
+		case node.Blacklisted || node.InitialCheckDone && !node.Available:
+			status = nodeUnavailable
+		case node.InitialCheckDone && node.Available && node.LastProbeLatency > 0:
+			status = nodeHealthy
+		}
+		identity := config.NodeConfig{URI: node.URI}
+		key := identity.NodeKey()
+		// A healthy instance takes precedence if several entries share an identity.
+		availability[key] = max(availability[key], status)
+	}
+	return availability
+}
+
+func createConfig(base *config.Config, nodes []config.NodeConfig, availability map[string]nodeAvailability) *config.Config {
 	newCfg := cloneConfig(base)
 	newCfg.Nodes = nil
+	present := make(map[string]bool, len(base.Nodes)+len(nodes))
 	for _, node := range base.Nodes {
 		if node.Source == config.NodeSourceInline {
 			newCfg.Nodes = append(newCfg.Nodes, node)
+			present[node.NodeKey()] = true
 		}
 	}
 	for _, node := range nodes {
 		node.Source = config.NodeSourceSubscription
 		newCfg.Nodes = append(newCfg.Nodes, node)
+		present[node.NodeKey()] = true
+	}
+	for _, node := range base.Nodes {
+		key := node.NodeKey()
+		status := availability[key]
+		if present[key] || status == nodeUnavailable || (status != nodeHealthy && node.Source != config.NodeSourceRetained) {
+			continue
+		}
+		node.Source = config.NodeSourceRetained
+		newCfg.Nodes = append(newCfg.Nodes, node)
+		present[key] = true
 	}
 	for i := range newCfg.Nodes {
 		node := &newCfg.Nodes[i]

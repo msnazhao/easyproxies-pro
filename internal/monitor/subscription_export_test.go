@@ -168,8 +168,10 @@ func TestExitProxySubscriptionSOCKS5WithoutAuth(t *testing.T) {
 		t.Fatalf("status=%d headers=%v", w.Code, w.Header())
 	}
 	want := map[string]string{
-		"美国 B #1": "wang._ip_8.8.8.8",
-		"英国 IPv6": "wang._ip_2606-4700--1111",
+		"美国 B #1":            "wang._ip_8.8.8.8",
+		"英国 IPv6":            "wang._ip_2606-4700--1111",
+		"Stale exit":         "wang._ip_9.9.9.9",
+		"Stale health probe": "wang._ip_149.112.112.112",
 	}
 	for _, line := range strings.Split(strings.TrimSpace(w.Body.String()), "\n") {
 		link, err := url.Parse(line)
@@ -289,7 +291,7 @@ func TestPartialExitLookupPreservesCountryFilterForTheSameAddress(t *testing.T) 
 	}
 	h.SetExit(ipmeta.Location{IP: "1.1.1.1"})
 	info = s.mgr.Snapshot()[0].NodeInfo
-	if info.CountryCode != "" || info.Country != "" || info.Region != "" || info.Provider != "" || info.ASN != "" || info.OrgDomain != "" {
+	if info.CountryCode != "ZZ" || info.Country != "" || info.Region != "" || info.Provider != "" || info.ASN != "" || info.OrgDomain != "" {
 		t.Fatalf("new IP inherited old metadata: %+v", info)
 	}
 	result = proxyAPIRequest(t, s, http.MethodGet, "/sub/proxies2", "")
@@ -299,6 +301,12 @@ func TestPartialExitLookupPreservesCountryFilterForTheSameAddress(t *testing.T) 
 	result = proxyAPIRequest(t, s, http.MethodGet, "/sub/proxies2?c=US", "")
 	if strings.Contains(result.Body.String(), "._ip_1.1.1.1") {
 		t.Fatalf("unclassified exit passed country filter: %s", result.Body)
+	}
+	for _, path := range []string{"/sub/proxies?c=zz", "/sub/proxies2?c=zz"} {
+		result = proxyAPIRequest(t, s, http.MethodGet, path, "")
+		if result.Code != http.StatusOK {
+			t.Fatalf("ZZ filter failed for %s: %d %s", path, result.Code, result.Body)
+		}
 	}
 }
 

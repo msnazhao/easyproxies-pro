@@ -29,16 +29,16 @@ type nodeMeasurements struct {
 	lastProbeAt      time.Time
 }
 
-func (m nodeMeasurements) restore(e *entry, now time.Time) {
+func (m nodeMeasurements) restore(e *entry) {
 	e.exitAttemptedAt = m.exitAttemptedAt
 	e.exitProbeFailure = m.exitProbeFailure
-	if now.Sub(m.exitVerifiedAt) >= exitRoutingTTL {
+	if !m.exitIP.IsValid() {
 		return
 	}
 	copyExitMetadata(&e.info, m.info)
 	formatNodeName(&e.info)
 	e.exitIP, e.exitVerifiedAt = m.exitIP, m.exitVerifiedAt
-	if now.Sub(m.lastProbeAt) >= exitRoutingTTL {
+	if m.lastProbeAt.IsZero() {
 		return
 	}
 	e.lastProbe, e.lastProbeAt, e.lastOK = m.lastProbe, m.lastProbeAt, m.lastProbeAt
@@ -61,13 +61,17 @@ func copyExitMetadata(dst *NodeInfo, src NodeInfo) {
 }
 
 func (info *NodeInfo) mergeExitLocation(location ipmeta.Location) {
-	if iso := geoip.NormalizeCountryCode(location.ISO); iso != "" {
+	if iso := geoip.NormalizeCountryCode(location.ISO); iso != geoip.UnknownCountryCode {
 		country := strings.TrimSpace(location.Country)
 		if info.CountryCode != iso || country != "" {
 			info.Country = country
 		}
 		info.CountryCode = iso
 		info.Region = geoip.RegionForISO(iso)
+	} else if info.ExitIP != "" && geoip.NormalizeCountryCode(info.CountryCode) == geoip.UnknownCountryCode {
+		info.CountryCode = geoip.UnknownCountryCode
+		info.Country = ""
+		info.Region = ""
 	}
 	if provider := strings.TrimSpace(location.Org); provider != "" {
 		info.Provider = provider

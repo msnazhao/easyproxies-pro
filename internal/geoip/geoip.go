@@ -692,22 +692,25 @@ func isoCodeToRegion(isoCode string) string {
 	}
 }
 
-// NormalizeCountryCode returns a normalized ISO alpha-2 country code, if known.
+// UnknownCountryCode represents a missing or invalid country code.
+const UnknownCountryCode = "ZZ"
+
+// NormalizeCountryCode returns a known ISO alpha-2 country code or ZZ.
 func NormalizeCountryCode(code string) string {
 	code = strings.ToUpper(strings.TrimSpace(code))
 	if len(code) != 2 {
-		return ""
+		return UnknownCountryCode
 	}
 	region, err := language.ParseRegion(code)
 	if err != nil || !region.IsCountry() || region.IsPrivateUse() {
-		return ""
+		return UnknownCountryCode
 	}
 	return code
 }
 
 // RegionForISO returns the routing bucket for a known country code.
 func RegionForISO(code string) string {
-	if code = NormalizeCountryCode(code); code == "" {
+	if code = NormalizeCountryCode(code); code == UnknownCountryCode {
 		return ""
 	}
 	return isoCodeToRegion(code)

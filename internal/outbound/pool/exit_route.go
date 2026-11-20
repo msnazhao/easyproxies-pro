@@ -1,6 +1,7 @@
 package pool
 
 import (
+	"context"
 	"errors"
 	"io"
 	"net/netip"
@@ -28,12 +29,13 @@ func (p *poolOutbound) pickExitIP(network string, tried map[string]bool, ip neti
 	now := time.Now()
 	var best *memberState
 	var bestLatency time.Duration
+	var bestFresh bool
 	for _, member := range p.members {
 		if tried[member.tag] {
 			continue
 		}
-		latency := member.entry.ExitRouteLatency(ip, now)
-		if latency <= 0 || (best != nil && latency >= bestLatency) {
+		latency := member.entry.ExitCandidateLatency(ip, now)
+		if latency <= 0 {
 			continue
 		}
 		if network != "" && !common.Contains(member.outbound.Network(), network) {
@@ -42,12 +44,35 @@ func (p *poolOutbound) pickExitIP(network string, tried map[string]bool, ip neti
 		if member.shared != nil && member.shared.isBlacklisted(now) {
 			continue
 		}
-		best, bestLatency = member, latency
+		fresh := member.entry.ExitRouteLatency(ip, now) > 0
+		if best == nil || fresh && !bestFresh || fresh == bestFresh && latency < bestLatency {
+			best, bestLatency, bestFresh = member, latency, fresh
+		}
 	}
 	if best == nil {
 		return nil, errNoExitCandidate
 	}
 	return best, nil
+}
+
+func (p *poolOutbound) verifyExitForDial(ctx context.Context, member *memberState, ip netip.Addr) error {
+	if !ip.IsValid() || member.entry.ExitRouteLatency(ip, time.Now()) > 0 {
+		return nil
+	}
+	if member.entry.ExitCandidateLatency(ip, time.Now()) == 0 {
+		return errExitChanged
+	}
+	if done := p.scheduleExitLookup(member, true); done != nil {
+		select {
+		case <-done:
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
+	if member.entry.ExitRouteLatency(ip, time.Now()) == 0 {
+		return errExitChanged
+	}
+	return nil
 }
 
 func checkDialedExit(conn io.Closer, err error, member *memberState, ip netip.Addr) error {

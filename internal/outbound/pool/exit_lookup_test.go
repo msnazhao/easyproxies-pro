@@ -30,6 +30,7 @@ func TestLookupExitRequiresAgreement(t *testing.T) {
 		{name: "address-only-keyed", echo: ipify, keyed: ipify, wantFirst: "/lite/me", addressOnly: true},
 		{name: "address-only-keyless", echo: ipify, fallback: ipify, wantFirst: "/echo", addressOnly: true},
 		{name: "unknown-country", echo: ipify, fallback: `{"ip":"8.8.8.8","country_code":"ZZ"}`, wantFirst: "/echo", addressOnly: true},
+		{name: "invalid-country", echo: ipify, fallback: `{"ip":"8.8.8.8","country_code":"__"}`, wantFirst: "/echo", addressOnly: true},
 		{name: "unavailable-key", echo: ipify, fallback: ipapi, keyed: "unauthorized", wantFirst: "/lite/me"},
 		{name: "keyed-mismatch", echo: ipify, fallback: ipapi, keyed: strings.Replace(ipinfo, "8.8.8.8", "1.1.1.1", 1), wantError: "exit probes disagree"},
 		{name: "no-key-mismatch", echo: ipify, fallback: strings.Replace(ipapi, "8.8.8.8", "1.1.1.1", 1), wantError: "exit probes disagree"},
@@ -91,6 +92,8 @@ func TestLookupExitRequiresAgreement(t *testing.T) {
 			want := ipmeta.Location{IP: "8.8.8.8", ASN: tc.wantASN}
 			if !tc.addressOnly {
 				want.ISO, want.Country, want.Org = "US", "United States", "Example ISP"
+			} else {
+				want.ISO = "ZZ"
 			}
 			if err != nil || location != want {
 				t.Fatalf("lookup = %+v, %v", location, err)

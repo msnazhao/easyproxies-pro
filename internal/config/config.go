@@ -198,6 +198,7 @@ const (
 	NodeSourceInline       NodeSource = "inline"       // Defined directly in config.yaml nodes array
 	NodeSourceFile         NodeSource = "nodes_file"   // Loaded from external nodes file
 	NodeSourceSubscription NodeSource = "subscription" // Fetched from subscription URL
+	NodeSourceRetained     NodeSource = "retained"     // Healthy node removed from a subscription
 )
 
 const (
@@ -510,6 +511,22 @@ func (c *Config) normalize() error {
 			}
 		}
 		c.Nodes = append(c.Nodes, subNodes...)
+	}
+	retained, err := loadNodesFromFile(c.RetainedNodesPath())
+	if err != nil && !errors.Is(err, os.ErrNotExist) {
+		return fmt.Errorf("load retained nodes: %w", err)
+	}
+	seen := make(map[string]bool, len(c.Nodes)+len(retained))
+	for _, node := range c.Nodes {
+		seen[node.NodeKey()] = true
+	}
+	for _, node := range retained {
+		key := node.NodeKey()
+		if !seen[key] {
+			node.Source = NodeSourceRetained
+			c.Nodes = append(c.Nodes, node)
+			seen[key] = true
+		}
 	}
 
 	if len(c.Nodes) == 0 {
@@ -1978,6 +1995,53 @@ func WriteNodesToFile(path string, nodes []NodeConfig) error {
 	return writeNodesToFile(path, nodes)
 }
 
+// RetainedNodesPath is the independent source for previously healthy nodes.
+func (c *Config) RetainedNodesPath() string {
+	path := c.NodesFile
+	if path == "" {
+		path = filepath.Join(filepath.Dir(c.filePath), "nodes.txt")
+	}
+	return path + ".retained"
+}
+
+// SaveSubscriptionSources saves retained nodes before updating the subscription
+// cache, restoring the retained file if the cache update fails.
+func (c *Config) SaveSubscriptionSources(path string, nodes []NodeConfig) error {
+	retainedPath := c.RetainedNodesPath()
+	old, readErr := readFileWithLock(retainedPath)
+	if readErr != nil && !errors.Is(readErr, os.ErrNotExist) {
+		return readErr
+	}
+	var retained []NodeConfig
+	for _, node := range c.Nodes {
+		if node.Source == NodeSourceRetained {
+			retained = append(retained, node)
+		}
+	}
+	if len(retained) == 0 && len(old) == 0 {
+		return WriteNodesToFile(path, nodes)
+	}
+	if err := writeRetainedNodes(retainedPath, retained); err != nil {
+		return err
+	}
+	if err := WriteNodesToFile(path, nodes); err != nil {
+		if rollbackErr := writeFileWithLock(retainedPath, old, 0o600); rollbackErr != nil {
+			return errors.Join(err, fmt.Errorf("restore retained nodes: %w", rollbackErr))
+		}
+		return err
+	}
+	return nil
+}
+
+func writeRetainedNodes(path string, nodes []NodeConfig) error {
+	var content strings.Builder
+	for _, node := range nodes {
+		content.WriteString(node.URI)
+		content.WriteByte('\n')
+	}
+	return writeFileWithLock(path, []byte(content.String()), 0o600)
+}
+
 // SaveNodes persists nodes to their appropriate locations based on source.
 // - subscription/nodes_file nodes → nodes.txt (or configured nodes_file)
 // - inline nodes → config.yaml nodes array
@@ -1998,6 +2062,7 @@ func (c *Config) SaveNodes() error {
 	// Separate nodes by source
 	var inlineNodes []NodeConfig
 	var fileNodes []NodeConfig
+	var retainedNodes []NodeConfig
 
 	for _, node := range c.Nodes {
 		// Create a clean copy without runtime fields for saving
@@ -2013,6 +2078,8 @@ func (c *Config) SaveNodes() error {
 			inlineNodes = append(inlineNodes, cleanNode)
 		case NodeSourceFile, NodeSourceSubscription:
 			fileNodes = append(fileNodes, cleanNode)
+		case NodeSourceRetained:
+			retainedNodes = append(retainedNodes, cleanNode)
 		default:
 			// Default to file nodes for unknown source
 			fileNodes = append(fileNodes, cleanNode)
@@ -2036,6 +2103,14 @@ func (c *Config) SaveNodes() error {
 	}
 
 	if err := updateConfigFile(c.filePath, func(saved *Config) { saved.Nodes = inlineNodes }); err != nil {
+		return err
+	}
+	retainedPath := c.RetainedNodesPath()
+	if _, err := os.Stat(retainedPath); len(retainedNodes) > 0 || err == nil {
+		if err := writeRetainedNodes(retainedPath, retainedNodes); err != nil {
+			return fmt.Errorf("write retained nodes: %w", err)
+		}
+	} else if !errors.Is(err, os.ErrNotExist) {
 		return err
 	}
 	log.Printf("✅ Saved %d inline nodes to %s", len(inlineNodes), c.filePath)
