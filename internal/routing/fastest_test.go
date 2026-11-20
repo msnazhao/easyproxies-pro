@@ -11,7 +11,7 @@ func TestParseFastestRoute(t *testing.T) {
 		{"account._fast1_us_", FastestRoute{Enabled: true, Country: "US"}},
 		{"account.with.dots._fast1_gb_", FastestRoute{Enabled: true, Country: "GB"}},
 		{"account._fast1_tr_", FastestRoute{Enabled: true, Country: "TR"}},
-		{"account.with.dots._fast1_isp_", FastestRoute{Enabled: true, ZeroAbuseISP: true}},
+		{"account.with.dots._fast1_isp_", FastestRoute{Enabled: true, LowestAbuseISP: true}},
 		{"account._fast1_usa_", FastestRoute{}},
 		{"account.task1", FastestRoute{}},
 	} {

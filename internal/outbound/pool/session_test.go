@@ -177,17 +177,19 @@ func TestFastestSessionCountryFilter(t *testing.T) {
 	}
 }
 
-func TestFastestSessionZeroAbuseISP(t *testing.T) {
-	zero, positive := 0, 1
+func TestFastestSessionLowestAbuseISP(t *testing.T) {
+	zero, low, high := 0, 10, 30
 	nodes := []struct {
 		tag, usage string
 		score      *int
+		latency    time.Duration
 	}{
-		{"hosting", "Data Center/Web Hosting/Transit", &zero},
-		{"nonzero", "Fixed Line ISP", &positive},
-		{"unknown", "Fixed Line ISP", nil},
-		{"mobile", "Mobile ISP", &zero},
-		{"fixed", "Fixed Line ISP", &zero},
+		{"hosting", "Data Center/Web Hosting/Transit", &zero, time.Millisecond},
+		{"higher-score", "Fixed Line ISP", &high, 2 * time.Millisecond},
+		{"unknown", "Fixed Line ISP", nil, 3 * time.Millisecond},
+		{"mobile", "Mobile ISP", &zero, 4 * time.Millisecond},
+		{"slower-fixed", "Fixed Line ISP", &low, 6 * time.Millisecond},
+		{"fixed", "Fixed Line ISP", &low, 5 * time.Millisecond},
 	}
 	outbounds := make([]*sessionTestOutbound, 0, len(nodes))
 	for _, node := range nodes {
@@ -202,7 +204,7 @@ func TestFastestSessionZeroAbuseISP(t *testing.T) {
 			Tag: node.tag, ExitIP: "8.8.8.8", NetworkType: abuse.NetworkType(), Abuse: &abuse,
 		})
 		entry.MarkInitialCheckDone(true)
-		entry.RecordSuccessWithLatency(time.Duration(i+1) * time.Millisecond)
+		entry.RecordSuccessWithLatency(node.latency)
 		p.members[i].entry = entry
 	}
 
@@ -221,7 +223,12 @@ func TestFastestSessionZeroAbuseISP(t *testing.T) {
 	outbounds[3].setDialHook(func(context.Context) error { return errors.New("dial failed") })
 	mustSessionTestDial(t, ctx, p, "fixed")
 	p.members[3].entry.MarkAvailable(false)
+	mustSessionTestDial(t, ctx, p, "fixed")
+	p.members[5].entry.MarkAvailable(false)
+	mustSessionTestDial(t, ctx, p, "slower-fixed")
 	p.members[4].entry.MarkAvailable(false)
+	mustSessionTestDial(t, ctx, p, "higher-score")
+	p.members[1].entry.MarkAvailable(false)
 	if _, err := sessionTestDialTag(ctx, p); err == nil {
 		t.Fatal("ISP route fell back to an ineligible node")
 	}

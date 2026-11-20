@@ -614,6 +614,14 @@ func (p *poolOutbound) pickMemberFor(network string, tried map[string]bool, stic
 		}
 		p.mu.Unlock()
 	}
+	if fastest.LowestAbuseISP {
+		member := selectLowestAbuseISP(candidates, tried)
+		p.putCandidateBuffer(candidates)
+		if member == nil {
+			return nil, E.New("no measured healthy ISP proxy with a known AbuseIPDB score available")
+		}
+		return member, nil
+	}
 	if fastest.Enabled {
 		filtered := candidates[:0]
 		for _, member := range candidates {
@@ -624,17 +632,11 @@ func (p *poolOutbound) pickMemberFor(network string, tried map[string]bool, stic
 			if fastest.Country != "" && (!entry.ExitKnown() || entry.ExitCountryCode() != fastest.Country) {
 				continue
 			}
-			if fastest.ZeroAbuseISP && !entry.HasZeroAbuseISP() {
-				continue
-			}
 			filtered = append(filtered, member)
 		}
 		candidates = filtered
 		if len(candidates) == 0 {
 			p.putCandidateBuffer(candidates)
-			if fastest.ZeroAbuseISP {
-				return nil, E.New("no measured healthy ISP proxy with AbuseIPDB score 0 available")
-			}
 			return nil, E.New("no measured healthy proxy available")
 		}
 	}
@@ -863,6 +865,33 @@ func (p *poolOutbound) selectByMode(candidates []*memberState) *memberState {
 		idx := int(p.rrCounter.Add(1)-1) % len(candidates)
 		return candidates[idx]
 	}
+}
+
+func selectLowestAbuseISP(candidates []*memberState, tried map[string]bool) *memberState {
+	var selected *memberState
+	var bestScore int
+	var bestLatency time.Duration
+	var selectedTried bool
+	for _, member := range candidates {
+		memberTried := tried[member.tag]
+		if selected != nil && !selectedTried && memberTried {
+			continue
+		}
+		score, known := member.entry.ISPAbuseScore()
+		if !known || !member.entry.Available() {
+			continue
+		}
+		latency := member.entry.LastLatency()
+		if latency <= 0 {
+			continue
+		}
+		// Prefer untried nodes. Once they run out, allow retries of eligible nodes.
+		if selected == nil || (selectedTried && !memberTried) ||
+			score < bestScore || (score == bestScore && latency < bestLatency) {
+			selected, bestScore, bestLatency, selectedTried = member, score, latency, memberTried
+		}
+	}
+	return selected
 }
 
 func (p *poolOutbound) selectLowestLatency(candidates []*memberState) *memberState {

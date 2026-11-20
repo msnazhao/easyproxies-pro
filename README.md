@@ -213,7 +213,7 @@ The reserved session username suffix `._fast1_` (for example `wang._fast1_`) sel
 
 Use `._fast1_us_` or `._fast1_gb_` to restrict selection to a measured US or GB exit. If no healthy matching exit exists, the request fails without falling back to another country.
 
-Use `username._fast1_isp_` to select the lowest-latency healthy exit that AbuseIPDB identifies as a fixed-line or mobile ISP with a score of exactly `0`. Configure `ip_metadata.abuseipdb_keys` to obtain scores. The route selects an exit on every new connection and fails if no node qualifies.
+Use `username._fast1_isp_` to select the healthy fixed-line or mobile ISP exit with the lowest known AbuseIPDB score. If scores tie, the exit with the lowest measured latency wins. Configure `ip_metadata.abuseipdb_keys` to obtain scores. The route selects an exit on every new connection and fails if no eligible ISP exit has a score.
 
 ### Supported Regions
 

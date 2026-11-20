@@ -4,9 +4,9 @@ import "strings"
 
 // FastestRoute describes the selection requested by a reserved session suffix.
 type FastestRoute struct {
-	Enabled      bool
-	Country      string
-	ZeroAbuseISP bool
+	Enabled        bool
+	Country        string
+	LowestAbuseISP bool
 }
 
 // ParseFastestRoute recognizes the reserved fastest-session suffixes.
@@ -20,7 +20,7 @@ func ParseFastestRoute(key string) FastestRoute {
 	case "_fast1_":
 		return FastestRoute{Enabled: true}
 	case "_fast1_isp_":
-		return FastestRoute{Enabled: true, ZeroAbuseISP: true}
+		return FastestRoute{Enabled: true, LowestAbuseISP: true}
 	}
 	if len(id) == len("_fast1_us_") && strings.HasPrefix(id, "_fast1_") && strings.HasSuffix(id, "_") {
 		code := id[7:9]
