@@ -185,3 +185,197 @@ func TestExitLookupIdentifiesProviderRateLimits(t *testing.T) {
 		})
 	}
 }
+
+func TestCloudflarePriorityAndDualStackVerification(t *testing.T) {
+	const (
+		ipv4A = "1.2.3.4"
+		ipv4B = "5.6.7.8"
+		ipv6A = "2605:6400::1"
+		ipv6B = "2605:6400::2"
+	)
+
+	t.Run("cloudflare v4 is first priority and plain-text verifier confirms", func(t *testing.T) {
+		var order []string
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			order = append(order, r.URL.Path)
+			switch r.URL.Path {
+			case "/cf-v4":
+				_, _ = w.Write([]byte("fl=1\nip=" + ipv4A + "\nloc=US\n"))
+			case "/checkip":
+				_, _ = w.Write([]byte(ipv4A + "\n"))
+			default:
+				w.WriteHeader(http.StatusInternalServerError)
+			}
+		}))
+		defer srv.Close()
+
+		cfg := exitProbeConfig{
+			CFTraceV4URL:        srv.URL + "/cf-v4",
+			CFTraceV6URL:        srv.URL + "/cf-v6",
+			CFTraceDualURL:      srv.URL + "/cf-dual",
+			VerifyV4URLs:        []string{srv.URL + "/checkip"},
+			VerifyV6URLs:        []string{srv.URL + "/v6-verify"},
+			FallbackEchoURL:     srv.URL + "/fallback-echo",
+			FallbackLocationURL: srv.URL + "/fallback-loc",
+		}
+		loc, err := lookupExitWithConfig(context.Background(), srv.Client(), cfg, nil)
+		if err != nil {
+			t.Fatalf("lookupExitWithConfig failed: %v", err)
+		}
+		if loc.IP != ipv4A || loc.ISO != "US" {
+			t.Fatalf("unexpected location: %+v", loc)
+		}
+		if len(order) != 2 || order[0] != "/cf-v4" || order[1] != "/checkip" {
+			t.Fatalf("unexpected request order: %v", order)
+		}
+	})
+
+	t.Run("ipv6-only falls back from cf-v4 to cf-v6 and verifies with v6 verifier", func(t *testing.T) {
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			switch r.URL.Path {
+			case "/cf-v4":
+				w.WriteHeader(http.StatusBadGateway)
+			case "/cf-v6":
+				_, _ = w.Write([]byte("ip=" + ipv6A + "\nloc=JP\n"))
+			case "/v6-verify":
+				_, _ = w.Write([]byte(`{"ip":"` + ipv6A + `"}`))
+			default:
+				w.WriteHeader(http.StatusNotFound)
+			}
+		}))
+		defer srv.Close()
+
+		cfg := exitProbeConfig{
+			CFTraceV4URL: srv.URL + "/cf-v4",
+			CFTraceV6URL: srv.URL + "/cf-v6",
+			VerifyV4URLs: []string{srv.URL + "/v4-verify"},
+			VerifyV6URLs: []string{srv.URL + "/v6-verify"},
+		}
+		loc, err := lookupExitWithConfig(context.Background(), srv.Client(), cfg, nil)
+		if err != nil || loc.IP != ipv6A || loc.ISO != "JP" {
+			t.Fatalf("ipv6 lookup = %+v, %v", loc, err)
+		}
+	})
+
+	t.Run("dual-stack cross-family observation does not trigger false mismatch", func(t *testing.T) {
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			switch r.URL.Path {
+			case "/cf-v4":
+				_, _ = w.Write([]byte("ip=" + ipv4A + "\nloc=US\n"))
+			case "/lite/me":
+				// Keyed endpoint connected via IPv6 on a dual-stack proxy
+				_, _ = w.Write([]byte(`{"ip":"` + ipv6A + `","country_code":"US","country":"United States","as_name":"DualISP","asn":"AS1"}`))
+			case "/checkip":
+				_, _ = w.Write([]byte(ipv4A + "\n"))
+			case "/cf-v6":
+				_, _ = w.Write([]byte("ip=" + ipv6A + "\nloc=DE\n"))
+			case "/v6-dual-returns-v4":
+				_, _ = w.Write([]byte(`{"ip":"` + ipv4A + `"}`))
+			case "/v6-match":
+				_, _ = w.Write([]byte(`{"ip":"` + ipv6A + `"}`))
+			default:
+				w.WriteHeader(http.StatusServiceUnavailable)
+			}
+		}))
+		defer srv.Close()
+
+		meta := ipmeta.New()
+		defer meta.Close()
+		meta.InfoURL = srv.URL + "/lite/"
+		meta.Configure(ipmeta.Config{IPinfoKeys: []string{"test-key"}})
+
+		cfg := exitProbeConfig{
+			CFTraceV4URL: srv.URL + "/cf-v4",
+			VerifyV4URLs: []string{srv.URL + "/checkip"},
+		}
+		loc, err := lookupExitWithConfig(context.Background(), srv.Client(), cfg, meta)
+		if err != nil || loc.IP != ipv4A || loc.ISO != "US" {
+			t.Fatalf("dual-stack IPv4 with IPv6 ipinfo = %+v, %v", loc, err)
+		}
+
+		cfgV6 := exitProbeConfig{
+			CFTraceV6URL: srv.URL + "/cf-v6",
+			VerifyV6URLs: []string{srv.URL + "/v6-dual-returns-v4", srv.URL + "/v6-match"},
+		}
+		locV6, err := lookupExitWithConfig(context.Background(), srv.Client(), cfgV6, nil)
+		if err != nil || locV6.IP != ipv6A || locV6.ISO != "DE" {
+			t.Fatalf("dual-stack IPv6 ignoring v4 echo = %+v, %v", locV6, err)
+		}
+	})
+
+	t.Run("genuine same-family mismatch rejects both v4 and v6", func(t *testing.T) {
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			switch r.URL.Path {
+			case "/cf-v4":
+				_, _ = w.Write([]byte("ip=" + ipv4A + "\nloc=US\n"))
+			case "/checkip":
+				_, _ = w.Write([]byte(ipv4B))
+			case "/cf-v6":
+				_, _ = w.Write([]byte("ip=" + ipv6A + "\nloc=US\n"))
+			case "/v6-verify":
+				_, _ = w.Write([]byte(`{"ip":"` + ipv6B + `"}`))
+			}
+		}))
+		defer srv.Close()
+
+		if _, err := lookupExitWithConfig(context.Background(), srv.Client(), exitProbeConfig{
+			CFTraceV4URL: srv.URL + "/cf-v4",
+			VerifyV4URLs: []string{srv.URL + "/checkip"},
+		}, nil); !errors.Is(err, errExitProbeMismatch) {
+			t.Fatalf("expected IPv4 mismatch error, got %v", err)
+		}
+
+		if _, err := lookupExitWithConfig(context.Background(), srv.Client(), exitProbeConfig{
+			CFTraceV6URL: srv.URL + "/cf-v6",
+			VerifyV6URLs: []string{srv.URL + "/v6-verify"},
+		}, nil); !errors.Is(err, errExitProbeMismatch) {
+			t.Fatalf("expected IPv6 mismatch error, got %v", err)
+		}
+	})
+
+	t.Run("verifier fallback, rate limit propagation, and non-cf fallback", func(t *testing.T) {
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			switch r.URL.Path {
+			case "/cf-v4":
+				_, _ = w.Write([]byte("ip=" + ipv4A + "\nloc=SG\n"))
+			case "/rl":
+				w.WriteHeader(http.StatusTooManyRequests)
+			case "/v4-ok":
+				_, _ = w.Write([]byte(`{"ip":"` + ipv4A + `"}`))
+			case "/cf-down":
+				w.WriteHeader(http.StatusServiceUnavailable)
+			case "/fallback-echo":
+				_, _ = w.Write([]byte(`{"ip":"` + ipv4A + `"}`))
+			case "/fallback-loc":
+				_, _ = w.Write([]byte(`{"ip":"` + ipv4A + `","country_code":"SG","country_name":"Singapore","org":"Cloud"}`))
+			}
+		}))
+		defer srv.Close()
+
+		loc, err := lookupExitWithConfig(context.Background(), srv.Client(), exitProbeConfig{
+			CFTraceV4URL: srv.URL + "/cf-v4",
+			VerifyV4URLs: []string{srv.URL + "/rl", srv.URL + "/v4-ok"},
+		}, nil)
+		if err != nil || loc.IP != ipv4A || loc.ISO != "SG" {
+			t.Fatalf("fallback after 429 verifier failed: %+v, %v", loc, err)
+		}
+
+		if _, err := lookupExitWithConfig(context.Background(), srv.Client(), exitProbeConfig{
+			CFTraceV4URL: srv.URL + "/cf-v4",
+			VerifyV4URLs: []string{srv.URL + "/rl"},
+		}, nil); !errors.Is(err, errExitProbeRateLimited) {
+			t.Fatalf("expected errExitProbeRateLimited when all verifiers return 429, got %v", err)
+		}
+
+		locFallback, err := lookupExitWithConfig(context.Background(), srv.Client(), exitProbeConfig{
+			CFTraceV4URL:        srv.URL + "/cf-down",
+			CFTraceV6URL:        srv.URL + "/cf-down",
+			CFTraceDualURL:      srv.URL + "/cf-down",
+			FallbackEchoURL:     srv.URL + "/fallback-echo",
+			FallbackLocationURL: srv.URL + "/fallback-loc",
+		}, nil)
+		if err != nil || locFallback.IP != ipv4A || locFallback.Org != "Cloud" {
+			t.Fatalf("non-CF legacy fallback failed: %+v, %v", locFallback, err)
+		}
+	})
+}

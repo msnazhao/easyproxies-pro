@@ -19,6 +19,7 @@ import (
 	"easy_proxies/internal/boxmgr"
 	"easy_proxies/internal/config"
 	"easy_proxies/internal/monitor"
+	"easy_proxies/internal/prescreen"
 )
 
 // Logger defines logging interface.
@@ -113,6 +114,11 @@ func cloneConfig(cfg *config.Config) *config.Config {
 		value := *cfg.Sticky.SessionEnabled
 		copyCfg.Sticky.SessionEnabled = &value
 	}
+	if cfg.SubscriptionRefresh.PreScreenEnabled != nil {
+		value := *cfg.SubscriptionRefresh.PreScreenEnabled
+		copyCfg.SubscriptionRefresh.PreScreenEnabled = &value
+	}
+	copyCfg.DNS.FallbackServers = append([]string(nil), cfg.DNS.FallbackServers...)
 	return &copyCfg
 }
 
@@ -526,7 +532,7 @@ func (m *Manager) doRefresh(cfg *config.Config, version uint64) error {
 }
 
 func sameSubscriptionConfig(a, b *config.Config) bool {
-	return a != nil && b != nil && slices.Equal(a.Subscriptions, b.Subscriptions) && a.SubscriptionRefresh == b.SubscriptionRefresh
+	return a != nil && b != nil && slices.Equal(a.Subscriptions, b.Subscriptions) && a.SubscriptionRefresh.Equal(b.SubscriptionRefresh)
 }
 
 // runtimeSubscriptionConfig must be called without holding runtime lifecycle
@@ -667,6 +673,22 @@ func (m *Manager) fetchSubscriptions(cfg *config.Config) ([]config.NodeConfig, e
 	if stats.Failed > 0 || stats.Empty > 0 {
 		return nil, fmt.Errorf("subscription refresh incomplete (%d/%d URLs failed, %d returned no usable nodes); keeping current nodes: %v", stats.Failed, stats.UniqueURLs, stats.Empty, stats.LastError)
 	}
+	if len(nodes) > 0 && cfg.SubscriptionRefresh.PreScreenEnabledFor(len(nodes)) {
+		res, err := prescreen.Filter(m.ctx, nodes, prescreen.Options{
+			Concurrency:    cfg.SubscriptionRefresh.PreScreenConcurrencyOrDefault(),
+			DNSTimeout:     cfg.SubscriptionRefresh.PreScreenTimeoutOrDefault(),
+			TCPTimeout:     cfg.SubscriptionRefresh.PreScreenTimeoutOrDefault(),
+			SkipCertVerify: cfg.SkipCertVerify,
+			Loggerf:        m.logger.Infof,
+		})
+		if err != nil {
+			return nil, err
+		}
+		if len(res.Nodes) == 0 {
+			return nil, errors.New("no reachable nodes remain after subscription pre-screening; keeping current nodes")
+		}
+		nodes = res.Nodes
+	}
 	return nodes, nil
 }
 
@@ -725,7 +747,12 @@ func createConfig(base *config.Config, nodes []config.NodeConfig, availability m
 		newCfg.Nodes = append(newCfg.Nodes, node)
 		present[node.NodeKey()] = true
 	}
+	const maxRetainedNodes = 500
+	retainedAdded := 0
 	for _, node := range base.Nodes {
+		if retainedAdded >= maxRetainedNodes {
+			break
+		}
 		key := node.NodeKey()
 		status := availability[key]
 		if present[key] || status == nodeUnavailable || (status != nodeHealthy && node.Source != config.NodeSourceRetained) {
@@ -734,6 +761,7 @@ func createConfig(base *config.Config, nodes []config.NodeConfig, availability m
 		node.Source = config.NodeSourceRetained
 		newCfg.Nodes = append(newCfg.Nodes, node)
 		present[key] = true
+		retainedAdded++
 	}
 	for i := range newCfg.Nodes {
 		node := &newCfg.Nodes[i]

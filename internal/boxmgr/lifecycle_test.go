@@ -4,6 +4,9 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -12,6 +15,11 @@ import (
 
 	"easy_proxies/internal/config"
 	"easy_proxies/internal/monitor"
+	"easy_proxies/internal/outbound/pool"
+
+	C "github.com/sagernet/sing-box/constant"
+	"github.com/sagernet/sing-box/option"
+	"github.com/sagernet/sing/common/json/badoption"
 )
 
 type lifecycleTestBox struct {
@@ -408,5 +416,221 @@ func BenchmarkCurrentSubscriptionConfig(b *testing.B) {
 				}
 			}
 		})
+	}
+}
+
+func TestPrevalidateOptionsStripsMultipleInvalidOutbounds(t *testing.T) {
+	opts := option.Options{
+		Outbounds: []option.Outbound{
+			{
+				Type: C.TypeHTTP,
+				Tag:  "valid-1",
+				Options: &option.HTTPOutboundOptions{
+					ServerOptions: option.ServerOptions{Server: "127.0.0.1", ServerPort: 8080},
+				},
+			},
+			{
+				Type: C.TypeShadowsocks,
+				Tag:  "invalid-1",
+				Options: &option.ShadowsocksOutboundOptions{
+					ServerOptions: option.ServerOptions{Server: "1.2.3.4", ServerPort: 443},
+					Method:        "not-a-valid-ss-method",
+				},
+			},
+			{
+				Type: C.TypeShadowsocks,
+				Tag:  "invalid-2",
+				Options: &option.ShadowsocksOutboundOptions{
+					ServerOptions: option.ServerOptions{Server: "1.2.3.5", ServerPort: 443},
+					Method:        "another-bad-method",
+				},
+			},
+			{
+				Type: C.TypeHTTP,
+				Tag:  "valid-2",
+				Options: &option.HTTPOutboundOptions{
+					ServerOptions: option.ServerOptions{Server: "127.0.0.2", ServerPort: 8081},
+				},
+			},
+			{
+				Type: pool.Type,
+				Tag:  pool.Tag,
+				Options: &pool.Options{
+					Members: []string{"valid-1", "invalid-1", "invalid-2", "valid-2"},
+					Metadata: map[string]pool.MemberMeta{
+						"valid-1":   {Name: "valid-1"},
+						"invalid-1": {Name: "invalid-1"},
+						"invalid-2": {Name: "invalid-2"},
+						"valid-2":   {Name: "valid-2"},
+					},
+				},
+			},
+			{
+				Type: pool.Type,
+				Tag:  "empty-pool",
+				Options: &pool.Options{
+					Members:  []string{"invalid-1"},
+					Metadata: map[string]pool.MemberMeta{"invalid-1": {Name: "invalid-1"}},
+				},
+			},
+		},
+		Route: &option.RouteOptions{
+			Final: pool.Tag,
+			Rules: []option.Rule{
+				{
+					Type: C.RuleTypeDefault,
+					DefaultOptions: option.DefaultRule{
+						RawDefaultRule: option.RawDefaultRule{Inbound: badoption.Listable[string]{"empty-in"}},
+						RuleAction: option.RuleAction{
+							Action:       C.RuleActionTypeRoute,
+							RouteOptions: option.RouteActionOptions{Outbound: "empty-pool"},
+						},
+					},
+				},
+				{
+					Type: C.RuleTypeDefault,
+					DefaultOptions: option.DefaultRule{
+						RawDefaultRule: option.RawDefaultRule{Inbound: badoption.Listable[string]{"keep-in"}},
+						RuleAction: option.RuleAction{
+							Action:       C.RuleActionTypeRoute,
+							RouteOptions: option.RouteActionOptions{Outbound: pool.Tag},
+						},
+					},
+				},
+			},
+		},
+	}
+
+	cleaned, err := prevalidateOptions(context.Background(), opts)
+	if err != nil {
+		t.Fatalf("prevalidateOptions failed: %v", err)
+	}
+	if len(cleaned.Outbounds) != 3 {
+		t.Fatalf("expected 2 valid outbounds + 1 pool, got %d", len(cleaned.Outbounds))
+	}
+	poolOpts := cleaned.Outbounds[2].Options.(*pool.Options)
+	if len(poolOpts.Members) != 2 || poolOpts.Members[0] != "valid-1" || poolOpts.Members[1] != "valid-2" {
+		t.Fatalf("unexpected pool members after prune: %+v", poolOpts.Members)
+	}
+	if _, ok := poolOpts.Metadata["invalid-1"]; ok {
+		t.Fatal("stale metadata remained for removed outbound")
+	}
+	if len(cleaned.Route.Rules) != 1 || cleaned.Route.Rules[0].DefaultOptions.RuleAction.RouteOptions.Outbound != pool.Tag {
+		t.Fatalf("dangling route rule not pruned: %+v", cleaned.Route.Rules)
+	}
+}
+
+func TestReloadInvalidConfigLeavesRunningBoxUntouched(t *testing.T) {
+	a, b := newSessionLocalUpstream(t, "node-a"), newSessionLocalUpstream(t, "node-b")
+	m, cfg := startSessionLocalManager(t, a, b, nil)
+
+	m.mu.RLock()
+	prevBox := m.currentBox
+	m.mu.RUnlock()
+
+	invalid := m.CurrentConfig()
+	invalid.Nodes = []config.NodeConfig{{Name: "invalid", URI: "unsupported://fixture"}}
+	if err := m.Reload(invalid); err == nil {
+		t.Fatal("expected invalid reload to fail")
+	}
+
+	m.mu.RLock()
+	curBox := m.currentBox
+	m.mu.RUnlock()
+	if curBox != prevBox {
+		t.Fatal("failed reload stopped/replaced running box instead of preserving zero downtime")
+	}
+	if got := sessionLocalHTTPNode(t, cfg, "wang.zero-downtime"); got != "node-a" {
+		t.Fatalf("expected existing running box to keep serving, got %q", got)
+	}
+}
+
+func TestReloadUpdatesMonitorProbeTargetAndRestoresOnRollback(t *testing.T) {
+	m := lifecycleTestManager()
+	defer m.Close()
+
+	var failNext atomic.Bool
+	m.boxFactory = func(_ context.Context, cfg *config.Config) (managedBox, error) {
+		if failNext.Load() && cfg.Management.ProbeConcurrency == 128 {
+			return &lifecycleTestBox{start: func() error { return errors.New("boom") }}, nil
+		}
+		return &lifecycleTestBox{}, nil
+	}
+	if err := m.Start(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+
+	next := m.CurrentConfig()
+	next.Management.ProbeTarget = "https://example.org/probe"
+	next.Management.ProbeConcurrency = 64
+	if err := m.Reload(next); err != nil {
+		t.Fatalf("first reload failed: %v", err)
+	}
+	dst, _, _, _, ok := m.monitorMgr.DestinationForProbe()
+	if !ok || dst.String() != "example.org:443" || m.monitorMgr.ProbeConcurrency() != 64 {
+		t.Fatalf("reload did not update monitor probe target/concurrency: ok=%v dst=%s conc=%d", ok, dst.String(), m.monitorMgr.ProbeConcurrency())
+	}
+
+	failNext.Store(true)
+	failing := m.CurrentConfig()
+	failing.Management.ProbeTarget = "http://other.invalid:8080/health"
+	failing.Management.ProbeConcurrency = 128
+	if err := m.Reload(failing); err == nil {
+		t.Fatal("expected second reload to fail and roll back")
+	}
+	dst, _, _, _, ok = m.monitorMgr.DestinationForProbe()
+	if !ok || dst.String() != "example.org:443" || m.monitorMgr.ProbeConcurrency() != 64 {
+		t.Fatalf("rollback did not restore probe settings: ok=%v dst=%s conc=%d", ok, dst.String(), m.monitorMgr.ProbeConcurrency())
+	}
+}
+
+func TestStartPersistsReassignedPortToSidecar(t *testing.T) {
+	busyLn, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer busyLn.Close()
+	busyPort := uint16(busyLn.Addr().(*net.TCPAddr).Port)
+	if busyPort >= 65535 {
+		t.Skip("ephemeral port too high")
+	}
+
+	dir := t.TempDir()
+	cfgPath := filepath.Join(dir, "config.yaml")
+	cfg := &config.Config{
+		Mode:      "multi-port",
+		MultiPort: config.MultiPortConfig{Address: "127.0.0.1", BasePort: busyPort},
+		Nodes:     []config.NodeConfig{{Name: "fixture", URI: "http://127.0.0.1:1", Port: busyPort}},
+	}
+	cfg.SetFilePath(cfgPath)
+
+	m := New(cfg, monitor.Config{Enabled: false, ProbeTarget: ""})
+	defer m.Close()
+	m.boxFactory = func(_ context.Context, c *config.Config) (managedBox, error) {
+		p := c.Nodes[0].Port
+		return &lifecycleTestBox{
+			start: func() error {
+				ln, err := net.Listen("tcp", fmt.Sprintf("127.0.0.1:%d", p))
+				if err != nil {
+					return fmt.Errorf("listen tcp4 127.0.0.1:%d: bind: address already in use", p)
+				}
+				_ = ln.Close()
+				return nil
+			},
+		}, nil
+	}
+
+	if err := m.Start(context.Background()); err != nil {
+		t.Fatalf("Start failed: %v", err)
+	}
+	if cfg.Nodes[0].Port == busyPort {
+		t.Fatalf("expected port %d to be reassigned", busyPort)
+	}
+	data, err := os.ReadFile(filepath.Join(dir, "node_ports.json"))
+	if err != nil {
+		t.Fatalf("expected node_ports.json sidecar: %v", err)
+	}
+	if !strings.Contains(string(data), fmt.Sprintf(": %d", cfg.Nodes[0].Port)) {
+		t.Fatalf("node_ports.json did not persist reassigned port %d: %s", cfg.Nodes[0].Port, string(data))
 	}
 }

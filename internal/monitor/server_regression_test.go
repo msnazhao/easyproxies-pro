@@ -1,6 +1,7 @@
 package monitor
 
 import (
+	"compress/gzip"
 	"context"
 	"encoding/json"
 	"errors"
@@ -455,5 +456,43 @@ func TestSettingsDisabledGeoIPZeroIntervalRoundTrip(t *testing.T) {
 				t.Fatalf("GeoIP defaults not persisted: %+v", disk.GeoIP)
 			}
 		})
+	}
+}
+
+func TestNodesEndpointSupportsGzipCompression(t *testing.T) {
+	s, _ := newProxySessionTestServer(t, proxySessionTestConfig())
+	h1 := s.mgr.Register(NodeInfo{Tag: "n1", Name: "node-1"})
+	h1.MarkInitialCheckDone(true)
+	h1.RecordSuccessWithLatency(12 * time.Millisecond)
+	s.mgr.Register(NodeInfo{Tag: "n2", Name: "node-2"})
+
+	r := httptest.NewRequest(http.MethodGet, "/api/nodes", nil)
+	r.Header.Set("Accept-Encoding", "gzip")
+	w := httptest.NewRecorder()
+	s.srv.Handler.ServeHTTP(w, r)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200", w.Code)
+	}
+	if got := w.Header().Get("Content-Encoding"); got != "gzip" {
+		t.Fatalf("Content-Encoding = %q, want gzip", got)
+	}
+	gz, err := gzip.NewReader(w.Body)
+	if err != nil {
+		t.Fatalf("gzip.NewReader failed: %v", err)
+	}
+	defer gz.Close()
+
+	var payload struct {
+		TotalNodes int `json:"total_nodes"`
+		Nodes      []struct {
+			Tag string `json:"tag"`
+		} `json:"nodes"`
+	}
+	if err := json.NewDecoder(gz).Decode(&payload); err != nil {
+		t.Fatalf("decode gzip JSON failed: %v", err)
+	}
+	if payload.TotalNodes != 2 || len(payload.Nodes) != 2 {
+		t.Fatalf("unexpected decoded payload: %+v", payload)
 	}
 }

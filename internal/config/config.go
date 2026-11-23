@@ -34,6 +34,7 @@ type Config struct {
 	Management          ManagementConfig          `yaml:"management"`
 	SubscriptionRefresh SubscriptionRefreshConfig `yaml:"subscription_refresh"`
 	GeoIP               GeoIPConfig               `yaml:"geoip"`
+	DNS                 DNSConfig                 `yaml:"dns,omitempty"`
 	Log                 LogConfig                 `yaml:"log"`
 	Nodes               []NodeConfig              `yaml:"nodes"`
 	NodesFile           string                    `yaml:"nodes_file"`    // 节点文件路径，每行一个 URI
@@ -63,6 +64,14 @@ type GeoIPConfig struct {
 	Port               uint16        `yaml:"port"`                 // GeoIP 路由监听端口，默认 1221
 	AutoUpdateEnabled  bool          `yaml:"auto_update_enabled"`  // 是否启用自动更新数据库
 	AutoUpdateInterval time.Duration `yaml:"auto_update_interval"` // 自动更新间隔，默认 24 小时
+}
+
+// DNSConfig controls optional sing-box DNS resolution settings.
+type DNSConfig struct {
+	Server          string   `yaml:"server,omitempty" json:"server,omitempty"`
+	FallbackServers []string `yaml:"fallback_servers,omitempty" json:"fallback_servers,omitempty"`
+	Port            uint16   `yaml:"port,omitempty" json:"port,omitempty"`
+	Strategy        string   `yaml:"strategy,omitempty" json:"strategy,omitempty"`
 }
 
 // ListenerConfig defines how the HTTP/SOCKS5 mixed proxy should listen for clients.
@@ -182,13 +191,74 @@ type ManagementConfig struct {
 
 // SubscriptionRefreshConfig controls subscription auto-refresh and reload settings.
 type SubscriptionRefreshConfig struct {
-	Enabled            bool          `yaml:"enabled"`              // 是否启用定时刷新
-	Interval           time.Duration `yaml:"interval"`             // 刷新间隔，默认 1 小时
-	Timeout            time.Duration `yaml:"timeout"`              // 获取订阅的超时时间
-	HealthCheckTimeout time.Duration `yaml:"health_check_timeout"` // 新节点健康检查超时
-	DrainTimeout       time.Duration `yaml:"drain_timeout"`        // 旧实例排空超时时间
-	MinAvailableNodes  int           `yaml:"min_available_nodes"`  // 最少可用节点数，低于此值不切换
-	FetchConcurrency   int           `yaml:"fetch_concurrency"`    // 订阅抓取并发数，默认 16，最大 32
+	Enabled              bool          `yaml:"enabled"`                         // 是否启用定时刷新
+	Interval             time.Duration `yaml:"interval"`                        // 刷新间隔，默认 1 小时
+	Timeout              time.Duration `yaml:"timeout"`                         // 获取订阅的超时时间
+	HealthCheckTimeout   time.Duration `yaml:"health_check_timeout"`            // 新节点健康检查超时
+	DrainTimeout         time.Duration `yaml:"drain_timeout"`                   // 旧实例排空超时时间
+	MinAvailableNodes    int           `yaml:"min_available_nodes"`             // 最少可用节点数，低于此值不切换
+	FetchConcurrency     int           `yaml:"fetch_concurrency"`               // 订阅抓取并发数，默认 16，最大 32
+	PreScreenEnabled     *bool         `yaml:"prescreen_enabled,omitempty"`     // 入核前快速预筛选开关，nil 表示按阈值自动启用
+	PreScreenThreshold   int           `yaml:"prescreen_threshold,omitempty"`   // 自动开启预筛选的节点数阈值（默认 50）
+	PreScreenConcurrency int           `yaml:"prescreen_concurrency,omitempty"` // 预筛选并发度（默认 256，上限 1024）
+	PreScreenTimeout     time.Duration `yaml:"prescreen_timeout,omitempty"`     // 预筛选单次 DNS/TCP 超时（默认 2s）
+}
+
+const (
+	defaultPreScreenThreshold   = 50
+	defaultPreScreenConcurrency = 256
+	maxPreScreenConcurrency     = 1024
+	defaultPreScreenTimeout     = 2 * time.Second
+)
+
+// PreScreenThresholdOrDefault returns the node count threshold for automatic pre-screening.
+func (s SubscriptionRefreshConfig) PreScreenThresholdOrDefault() int {
+	if s.PreScreenThreshold <= 0 {
+		return defaultPreScreenThreshold
+	}
+	return s.PreScreenThreshold
+}
+
+// PreScreenEnabledFor reports whether fast pre-screening should run for nodeCount nodes.
+func (s SubscriptionRefreshConfig) PreScreenEnabledFor(nodeCount int) bool {
+	if s.PreScreenEnabled != nil {
+		return *s.PreScreenEnabled
+	}
+	return nodeCount >= s.PreScreenThresholdOrDefault()
+}
+
+// PreScreenConcurrencyOrDefault returns the pre-screen worker concurrency clamped to [1, 1024].
+func (s SubscriptionRefreshConfig) PreScreenConcurrencyOrDefault() int {
+	if s.PreScreenConcurrency <= 0 {
+		return defaultPreScreenConcurrency
+	}
+	if s.PreScreenConcurrency > maxPreScreenConcurrency {
+		return maxPreScreenConcurrency
+	}
+	return s.PreScreenConcurrency
+}
+
+// PreScreenTimeoutOrDefault returns the per-host/endpoint pre-screen timeout.
+func (s SubscriptionRefreshConfig) PreScreenTimeoutOrDefault() time.Duration {
+	if s.PreScreenTimeout <= 0 {
+		return defaultPreScreenTimeout
+	}
+	return s.PreScreenTimeout
+}
+
+// Equal compares two SubscriptionRefreshConfig values including pointer fields.
+func (s SubscriptionRefreshConfig) Equal(other SubscriptionRefreshConfig) bool {
+	if (s.PreScreenEnabled == nil) != (other.PreScreenEnabled == nil) {
+		return false
+	}
+	if s.PreScreenEnabled != nil && *s.PreScreenEnabled != *other.PreScreenEnabled {
+		return false
+	}
+	sCopy := s
+	oCopy := other
+	sCopy.PreScreenEnabled = nil
+	oCopy.PreScreenEnabled = nil
+	return sCopy == oCopy
 }
 
 // NodeSource indicates where a node configuration originated from.
@@ -305,6 +375,17 @@ func stableNodeKey(uri string) string {
 
 // Load reads YAML config from disk and applies defaults/validation.
 func Load(path string) (*Config, error) {
+	return LoadContext(context.Background(), path)
+}
+
+// LoadContext reads YAML config from disk, allowing cancellation during initial subscription fetches.
+func LoadContext(ctx context.Context, path string) (*Config, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	data, err := readFileWithLock(path)
 	if err != nil {
 		return nil, fmt.Errorf("read config: %w", err)
@@ -321,13 +402,16 @@ func Load(path string) (*Config, error) {
 		explicitPorts[idx] = cfg.Nodes[idx].Port > 0
 	}
 
-	// Resolve nodes_file path relative to config file directory
+	configDir := filepath.Dir(path)
+	// Resolve relative paths relative to config file directory
 	if cfg.NodesFile != "" && !filepath.IsAbs(cfg.NodesFile) {
-		configDir := filepath.Dir(path)
 		cfg.NodesFile = filepath.Join(configDir, cfg.NodesFile)
 	}
+	if cfg.GeoIP.DatabasePath != "" && !filepath.IsAbs(cfg.GeoIP.DatabasePath) {
+		cfg.GeoIP.DatabasePath = filepath.Join(configDir, cfg.GeoIP.DatabasePath)
+	}
 
-	if err := cfg.normalize(); err != nil {
+	if err := cfg.normalizeContext(ctx); err != nil {
 		return nil, err
 	}
 
@@ -381,6 +465,13 @@ func ExtractNodeName(uri string) string {
 }
 
 func (c *Config) normalize() error {
+	return c.normalizeContext(context.Background())
+}
+
+func (c *Config) normalizeContext(ctx context.Context) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	if c.Mode == "" {
 		c.Mode = "pool"
 	}
@@ -453,6 +544,13 @@ func (c *Config) normalize() error {
 		c.SubscriptionRefresh.MinAvailableNodes = 1
 	}
 	c.SubscriptionRefresh.FetchConcurrency = normalizeSubscriptionFetchConcurrency(c.SubscriptionRefresh.FetchConcurrency)
+	if c.SubscriptionRefresh.PreScreenThreshold <= 0 {
+		c.SubscriptionRefresh.PreScreenThreshold = defaultPreScreenThreshold
+	}
+	c.SubscriptionRefresh.PreScreenConcurrency = c.SubscriptionRefresh.PreScreenConcurrencyOrDefault()
+	if c.SubscriptionRefresh.PreScreenTimeout <= 0 {
+		c.SubscriptionRefresh.PreScreenTimeout = defaultPreScreenTimeout
+	}
 
 	// Mark inline nodes with source
 	for idx := range c.Nodes {
@@ -480,11 +578,14 @@ func (c *Config) normalize() error {
 		}
 		cachedNodes, cacheErr := loadNodesFromFile(nodesFilePath)
 
-		subNodes, stats := FetchSubscriptionNodes(context.Background(), c.Subscriptions, SubscriptionFetchOptions{
+		subNodes, stats := FetchSubscriptionNodes(ctx, c.Subscriptions, SubscriptionFetchOptions{
 			Timeout:     c.SubscriptionRefresh.Timeout,
 			Concurrency: c.SubscriptionRefresh.FetchConcurrency,
 			Loggerf:     log.Printf,
 		})
+		if err := ctx.Err(); err != nil {
+			return err
+		}
 		if stats.Failed > 0 {
 			log.Printf("⚠️  Subscription initialization skipped %d/%d unique URLs; last error: %v", stats.Failed, stats.UniqueURLs, stats.LastError)
 		}
@@ -845,6 +946,13 @@ func (c *Config) NormalizeWithPortMap(portMap map[string]uint16) error {
 		c.SubscriptionRefresh.MinAvailableNodes = 1
 	}
 	c.SubscriptionRefresh.FetchConcurrency = normalizeSubscriptionFetchConcurrency(c.SubscriptionRefresh.FetchConcurrency)
+	if c.SubscriptionRefresh.PreScreenThreshold <= 0 {
+		c.SubscriptionRefresh.PreScreenThreshold = defaultPreScreenThreshold
+	}
+	c.SubscriptionRefresh.PreScreenConcurrency = c.SubscriptionRefresh.PreScreenConcurrencyOrDefault()
+	if c.SubscriptionRefresh.PreScreenTimeout <= 0 {
+		c.SubscriptionRefresh.PreScreenTimeout = defaultPreScreenTimeout
+	}
 
 	if len(c.Nodes) == 0 {
 		return errors.New("config.nodes cannot be empty")
@@ -2128,10 +2236,12 @@ func (c *Config) Save() error {
 // The caller must synchronize settings access; runtime node/subscription fields
 // deliberately are not read or copied.
 func (c *Config) SettingsSnapshot() Config {
+	dnsCopy := c.DNS
+	dnsCopy.FallbackServers = append([]string(nil), c.DNS.FallbackServers...)
 	return Config{
 		Mode: c.Mode, Listener: c.Listener, MultiPort: c.MultiPort, Pool: c.Pool,
 		Sticky: c.Sticky, Management: c.Management, ExternalIP: c.ExternalIP,
-		SkipCertVerify: c.SkipCertVerify, Log: c.Log, GeoIP: c.GeoIP, IPMetadata: c.IPMetadata,
+		SkipCertVerify: c.SkipCertVerify, Log: c.Log, GeoIP: c.GeoIP, DNS: dnsCopy, IPMetadata: c.IPMetadata,
 		filePath: c.filePath,
 	}
 }

@@ -475,6 +475,31 @@ func (l *Lookup) LookupIP(ipStr string) RegionInfo {
 	}
 }
 
+// LookupURIWithoutDNS returns region info for literal IP hosts or already-cached
+// domain hosts without issuing synchronous network DNS queries.
+func (l *Lookup) LookupURIWithoutDNS(uri string) RegionInfo {
+	if !l.IsEnabled() {
+		return unknownRegion()
+	}
+	host := extractHostFromURI(uri)
+	if host == "" {
+		return unknownRegion()
+	}
+	host = strings.ToLower(host)
+	if net.ParseIP(host) != nil {
+		if cached, ok := l.cachedHost(host); ok {
+			return cached
+		}
+		result := l.LookupIP(host)
+		l.cacheHost(host, result, dnsCacheTTL)
+		return result
+	}
+	if cached, ok := l.cachedHost(host); ok {
+		return cached
+	}
+	return unknownRegion()
+}
+
 // LookupURI extracts server from URI and returns region info
 func (l *Lookup) LookupURI(uri string) RegionInfo {
 	// Disabled/closed lookup never attempts DNS or writes to an uninitialized

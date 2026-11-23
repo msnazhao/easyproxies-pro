@@ -34,8 +34,25 @@ func (s *Server) writeProxySubscription(w http.ResponseWriter, r *http.Request, 
 	var exitProxy url.URL
 	if byExitIP {
 		cfg, _ := s.proxyRoutingSnapshot()
-		if enabled, _ := proxySessionAvailability(cfg); !enabled || cfg.Listener.Port == 0 {
-			http.Error(w, "exit IP sessions unavailable", http.StatusServiceUnavailable)
+		enabled, reason := proxySessionAvailability(cfg)
+		if !enabled || cfg == nil || cfg.Listener.Port == 0 {
+			if reason == "" {
+				reason = "共享代理入口端口未配置"
+			}
+			if s.logger != nil {
+				var mode string
+				var port uint16
+				var hasUser, sessionEnabled bool
+				if cfg != nil {
+					mode = cfg.Mode
+					port = cfg.Listener.Port
+					hasUser = cfg.Listener.Username != ""
+					sessionEnabled = cfg.Sticky.SessionRoutingEnabled()
+				}
+				s.logger.Printf("[sub/proxies2] exit IP sessions unavailable: %s (mode=%s port=%d has_username=%t session_enabled=%t)",
+					reason, mode, port, hasUser, sessionEnabled)
+			}
+			http.Error(w, "exit IP sessions unavailable: "+reason, http.StatusServiceUnavailable)
 			return
 		}
 		exitProxy = url.URL{

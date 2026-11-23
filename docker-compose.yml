@@ -41,4 +41,4 @@ services:
       # - ./config.yaml:/etc/easy_proxies/config.yaml
       # - ./nodes.txt:/etc/easy_proxies/nodes.txt
       # 日志映射目录（当从 WebUI 开启日志写到文件时有效）
-      - ./logs:/app/logs
+      - ./logs:/etc/easy_proxies/logs

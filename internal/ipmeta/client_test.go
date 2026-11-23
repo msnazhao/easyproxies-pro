@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -159,3 +160,41 @@ func TestSelfAccessBlockDoesNotDisableKeyForOtherNodes(t *testing.T) {
 type roundTripFunc func(*http.Request) (*http.Response, error)
 
 func (f roundTripFunc) RoundTrip(r *http.Request) (*http.Response, error) { return f(r) }
+
+func TestCacheEvictionRespectsMaxCacheEntries(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.Contains(r.URL.Path, "check") {
+			fmt.Fprint(w, `{"data":{"ipAddress":"8.8.8.8","abuseConfidenceScore":1,"usageType":"ISP","isp":"Example","domain":"example.com"}}`)
+			return
+		}
+		fmt.Fprint(w, `{"ip":"8.8.8.8","country_code":"US","country":"United States","as_name":"Example ISP"}`)
+	}))
+	defer server.Close()
+
+	service := New()
+	defer service.Close()
+	service.InfoURL = server.URL + "/info/"
+	service.info.client = server.Client()
+	service.AbuseURL = server.URL + "/check"
+	service.abuse.client = server.Client()
+	service.Configure(Config{IPinfoKeys: []string{"k1"}, AbuseKeys: []string{"k2"}})
+
+	for i := 0; i < maxCacheEntries; i++ {
+		service.locations[fmt.Sprintf("192.0.%d.%d", i/256, i%256)] = Location{IP: "x"}
+		service.checks[fmt.Sprintf("198.51.%d.%d", i/256, i%256)] = abuseCheck{retryAfter: time.Now().Add(time.Hour)}
+	}
+
+	if _, err := service.Lookup(context.Background(), "8.8.8.8"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := service.Check(context.Background(), "8.8.8.8"); err != nil {
+		t.Fatal(err)
+	}
+
+	service.mu.RLock()
+	locLen, checkLen := len(service.locations), len(service.checks)
+	service.mu.RUnlock()
+	if locLen > maxCacheEntries || checkLen > maxCacheEntries {
+		t.Fatalf("cache size exceeded cap %d: locations=%d checks=%d", maxCacheEntries, locLen, checkLen)
+	}
+}

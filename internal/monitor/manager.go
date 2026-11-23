@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"math"
 	"net"
 	"net/netip"
 	"sort"
@@ -112,39 +113,52 @@ type EntryHandle struct {
 }
 
 type entry struct {
-	metadataPending   bool
-	metadataUsed      bool
-	metadataVersion   uint64
-	metadataUsageDone bool
-	nextAbuseCheck    time.Time
-	info              NodeInfo
-	failure           int
-	success           int64
-	timeline          []TimelineEvent
-	blacklist         bool
-	until             time.Time
-	lastError         string
-	lastFail          time.Time
-	lastOK            time.Time
-	lastProbe         time.Duration
-	lastProbeAt       time.Time
-	active            atomic.Int32
-	lastUsedAt        atomic.Int64
-	probe             probeFunc
-	afterProbeSuccess func(context.Context)
-	probeRun          *probeRun
-	probeGeneration   uint64
-	exitPending       chan struct{}
-	exitProbeFailure  string
-	exitIP            netip.Addr
-	exitVerifiedAt    time.Time
-	exitAttemptedAt   time.Time
-	exitGeneration    uint64
-	release           releaseFunc
-	blacklistFn       func(time.Duration)
-	initialCheckDone  bool
-	available         bool
-	mu                sync.RWMutex
+	metadataPending    bool
+	metadataUsed       bool
+	metadataVersion    uint64
+	metadataUsageDone  bool
+	nextAbuseCheck     time.Time
+	info               NodeInfo
+	failure            int
+	success            int64
+	timeline           []TimelineEvent
+	blacklist          bool
+	until              time.Time
+	lastError          string
+	lastFail           time.Time
+	lastOK             time.Time
+	lastProbe          time.Duration
+	lastProbeAt        time.Time
+	active             atomic.Int32
+	lastUsedAt         atomic.Int64
+	probe              probeFunc
+	afterProbeSuccess  func(context.Context)
+	probeRun           *probeRun
+	probeGeneration    uint64
+	exitPending        chan struct{}
+	exitProbeFailure   string
+	exitIP             netip.Addr
+	exitVerifiedAt     time.Time
+	exitAttemptedAt    time.Time
+	exitGeneration     uint64
+	release            releaseFunc
+	blacklistFn        func(time.Duration)
+	initialCheckDone   bool
+	available          bool
+	needsRecoveryProbe bool
+	availableFast      atomic.Bool
+	blacklistUntilNano atomic.Int64
+	mu                 sync.RWMutex
+}
+
+type enrichTask struct {
+	ctx         context.Context
+	handle      *EntryHandle
+	info        NodeInfo
+	generation  uint64
+	needsEnrich bool
+	hasAbuse    bool
+	version     uint64
 }
 
 // Manager aggregates all node states for the UI/API.
@@ -163,6 +177,8 @@ type Manager struct {
 	ctx              context.Context
 	cancel           context.CancelFunc
 	logger           Logger
+	enrichCh         chan enrichTask
+	enrichOnce       sync.Once
 
 	// Sweep progress for the WebUI. probeSweepActive is 1 while probeAllNodes
 	// runs; the counters let the dashboard show a live "初始化探测中 3200/8363".
@@ -182,8 +198,10 @@ type Manager struct {
 	// registered nodes still get probed).
 	probeGate      sync.Mutex
 	sweepRunning   bool
+	sweepCancel    context.CancelFunc
 	rerunRequested bool
 	rerunSince     time.Time
+	rerunUnchecked bool
 }
 
 // ProbeSweepProgress reports the current health-check sweep progress. active is
@@ -335,7 +353,7 @@ func (m *Manager) StartPeriodicHealthCheck(interval, timeout time.Duration) {
 			case <-m.ctx.Done():
 				return
 			case <-ticker.C:
-				m.probeNodes(timeout, time.Now().Add(-interval))
+				m.probeNodes(timeout, time.Now().Add(-interval), false)
 			}
 		}
 	}()
@@ -350,6 +368,24 @@ func (m *Manager) ProbeAllNow(timeout time.Duration) {
 	m.probeAllNodes(timeout)
 }
 
+// ProbeUncheckedNow triggers a health check only for nodes without an initial result.
+func (m *Manager) ProbeUncheckedNow(timeout time.Duration) {
+	m.probeNodes(timeout, time.Time{}, true)
+}
+
+// CancelActiveSweep cancels any in-flight health-check sweep and clears queued reruns.
+func (m *Manager) CancelActiveSweep() {
+	m.probeGate.Lock()
+	cancel := m.sweepCancel
+	m.rerunRequested = false
+	m.rerunSince = time.Time{}
+	m.rerunUnchecked = false
+	m.probeGate.Unlock()
+	if cancel != nil {
+		cancel()
+	}
+}
+
 // probeAllNodes runs a health-check sweep, but only one at a time. If a sweep is
 // already in flight, the request is coalesced: exactly one additional sweep runs
 // after the current one finishes, so triggers that arrive mid-sweep (e.g. a
@@ -357,10 +393,10 @@ func (m *Manager) ProbeAllNow(timeout time.Duration) {
 // sweeps that would corrupt the shared progress counters and wedge the WebUI
 // progress bar "active" flag on.
 func (m *Manager) probeAllNodes(timeout time.Duration) {
-	m.probeNodes(timeout, time.Time{})
+	m.probeNodes(timeout, time.Time{}, false)
 }
 
-func (m *Manager) probeNodes(timeout time.Duration, since time.Time) {
+func (m *Manager) probeNodes(timeout time.Duration, since time.Time, onlyUnchecked bool) {
 	if m.ctx.Err() != nil {
 		return
 	}
@@ -368,8 +404,16 @@ func (m *Manager) probeNodes(timeout time.Duration, since time.Time) {
 	if m.sweepRunning {
 		// A sweep is running: request one follow-up pass and return. The running
 		// sweep will pick this up when it drains the gate.
-		if !m.rerunRequested || since.Before(m.rerunSince) {
+		if !m.rerunRequested {
 			m.rerunSince = since
+			m.rerunUnchecked = onlyUnchecked
+		} else {
+			if since.Before(m.rerunSince) {
+				m.rerunSince = since
+			}
+			if !onlyUnchecked {
+				m.rerunUnchecked = false
+			}
 		}
 		m.rerunRequested = true
 		m.probeGate.Unlock()
@@ -379,17 +423,27 @@ func (m *Manager) probeNodes(timeout time.Duration, since time.Time) {
 	m.probeGate.Unlock()
 
 	for {
-		m.runProbeSweep(timeout, since)
+		sweepCtx, sweepCancel := context.WithCancel(m.ctx)
+		m.probeGate.Lock()
+		m.sweepCancel = sweepCancel
+		m.probeGate.Unlock()
+
+		m.runProbeSweep(sweepCtx, timeout, since, onlyUnchecked)
+		sweepCancel()
 
 		m.probeGate.Lock()
+		m.sweepCancel = nil
 		if m.rerunRequested && m.ctx.Err() == nil {
 			since = m.rerunSince
+			onlyUnchecked = m.rerunUnchecked
 			m.rerunRequested = false
+			m.rerunUnchecked = false
 			m.probeGate.Unlock()
 			continue // A trigger arrived mid-sweep; run exactly one more pass.
 		}
 		m.rerunRequested = false
 		m.rerunSince = time.Time{}
+		m.rerunUnchecked = false
 		m.sweepRunning = false
 		m.probeGate.Unlock()
 		return
@@ -399,17 +453,28 @@ func (m *Manager) probeNodes(timeout time.Duration, since time.Time) {
 // runProbeSweep checks the selected nodes concurrently. probeNodes guarantees
 // single-flight execution, so the
 // shared probeSweep* progress counters are never written by two sweeps at once.
-func (m *Manager) runProbeSweep(timeout time.Duration, since time.Time) {
-	if m.ctx.Err() != nil {
+func (m *Manager) runProbeSweep(sweepCtx context.Context, timeout time.Duration, since time.Time, onlyUnchecked bool) {
+	if sweepCtx.Err() != nil {
 		return
 	}
+	now := time.Now()
 	m.mu.RLock()
 	logger := m.logger
 	entries := make([]*entry, 0, len(m.nodes))
 	for _, e := range m.nodes {
-		if since.IsZero() || e.usedSince(since) {
-			entries = append(entries, e)
+		e.mu.RLock()
+		checked := e.initialCheckDone
+		used := since.IsZero() || e.usedSince(since)
+		needsRecovery := e.needsRecoveryLocked(now)
+		e.mu.RUnlock()
+		if onlyUnchecked {
+			if checked {
+				continue
+			}
+		} else if !used && !needsRecovery {
+			continue
 		}
+		entries = append(entries, e)
 	}
 	m.mu.RUnlock()
 
@@ -456,6 +521,7 @@ func (m *Manager) runProbeSweep(timeout time.Duration, since time.Time) {
 			e.mu.Lock()
 			e.initialCheckDone = true
 			e.available = true
+			e.syncFastStateLocked()
 			e.mu.Unlock()
 			availableCount.Add(1)
 			m.probeSweepOK.Add(1)
@@ -465,7 +531,7 @@ func (m *Manager) runProbeSweep(timeout time.Duration, since time.Time) {
 
 		select {
 		case sem <- struct{}{}:
-		case <-m.ctx.Done():
+		case <-sweepCtx.Done():
 			wg.Wait()
 			return
 		}
@@ -473,12 +539,12 @@ func (m *Manager) runProbeSweep(timeout time.Duration, since time.Time) {
 		go func(entry *entry, tag string) {
 			defer wg.Done()
 			defer func() { <-sem }()
-			if !since.IsZero() && !entry.usedSince(since) {
+			if !since.IsZero() && !entry.usedSince(since) && !entry.needsRecovery(time.Now()) {
 				m.probeSweepDone.Add(1)
 				return
 			}
 
-			ctx, cancel := context.WithTimeout(m.ctx, timeout)
+			ctx, cancel := context.WithTimeout(sweepCtx, timeout)
 			defer cancel()
 			if !since.IsZero() {
 				ctx = context.WithValue(ctx, periodicProbeKey{}, since)
@@ -584,12 +650,15 @@ func (m *Manager) Register(info NodeInfo) *EntryHandle {
 // BeginNodeReload passes exit attempts and measured availability to matching nodes
 // in the replacement runtime. New entries keep old callbacks isolated.
 func (m *Manager) BeginNodeReload() func() {
+	m.CancelActiveSweep()
 	m.mu.Lock()
 	now := time.Now()
 	m.reloadMeasures = make(map[string]nodeMeasurements)
 	for _, e := range m.nodes {
 		e.mu.RLock()
-		if e.info.URI != "" && (!e.exitAttemptedAt.IsZero() || !e.exitVerifiedAt.IsZero()) {
+		blacklisted := e.blacklist && (e.until.IsZero() || now.Before(e.until))
+		healthy := e.initialCheckDone && e.available && !blacklisted
+		if e.info.URI != "" && (healthy || blacklisted || !e.exitAttemptedAt.IsZero() || !e.exitVerifiedAt.IsZero()) {
 			key := nodeIdentity(e.info)
 			measurements := nodeMeasurements{exitAttemptedAt: e.exitAttemptedAt, exitProbeFailure: e.exitProbeFailure}
 			if e.exitVerifiedAt.After(measurements.exitAttemptedAt) {
@@ -598,10 +667,23 @@ func (m *Manager) BeginNodeReload() func() {
 			if e.exitIP.IsValid() {
 				measurements.info, measurements.exitIP, measurements.exitVerifiedAt = e.info, e.exitIP, e.exitVerifiedAt
 			}
-			if e.exitRouteReadyLocked(now) {
-				measurements.lastProbe, measurements.lastProbeAt = e.lastProbe, e.lastProbeAt
+			if healthy {
+				measurements.healthy = true
+				measurements.lastProbe = e.lastProbe
+				measurements.lastProbeAt = e.lastProbeAt
+				measurements.lastOK = e.lastOK
+				if measurements.lastOK.IsZero() {
+					measurements.lastOK = now
+				}
+			} else if blacklisted {
+				measurements.blacklisted = true
+				measurements.wasAvailable = e.available
+				measurements.blacklistedUntil = e.until
+				measurements.lastError = e.lastError
 			}
-			m.reloadMeasures[key] = measurements
+			if prev, exists := m.reloadMeasures[key]; !exists || measurements.healthy && !prev.healthy {
+				m.reloadMeasures[key] = measurements
+			}
 		}
 		e.mu.RUnlock()
 	}
@@ -617,6 +699,7 @@ func (m *Manager) BeginNodeReload() func() {
 // ClearNodes removes all registered nodes. Call before re-registering
 // during a config reload so stale entries don't persist in the dashboard.
 func (m *Manager) ClearNodes() {
+	m.CancelActiveSweep()
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.nodes = make(map[string]*entry)
@@ -737,6 +820,7 @@ func (e *entry) applyProbeResult(ctx context.Context, generation uint64, latency
 		return false
 	}
 	e.initialCheckDone = true
+	e.needsRecoveryProbe = false
 	if err != nil {
 		e.lastError = err.Error()
 		e.lastFail = time.Now()
@@ -748,6 +832,7 @@ func (e *entry) applyProbeResult(ctx context.Context, generation uint64, latency
 		e.lastProbeAt = e.lastOK
 		e.available = true
 	}
+	e.syncFastStateLocked()
 	afterSuccess := e.afterProbeSuccess
 	e.mu.Unlock()
 	if err == nil && afterSuccess != nil {
@@ -938,10 +1023,24 @@ func (e *entry) appendTimelineLocked(success bool, latencyMs int64, errStr strin
 	}
 }
 
+func (e *entry) syncFastStateLocked() {
+	e.availableFast.Store(e.initialCheckDone && e.available)
+	if !e.blacklist {
+		e.blacklistUntilNano.Store(0)
+		return
+	}
+	if e.until.IsZero() {
+		e.blacklistUntilNano.Store(math.MaxInt64)
+		return
+	}
+	e.blacklistUntilNano.Store(e.until.UnixNano())
+}
+
 func (e *entry) blacklistUntil(until time.Time) {
 	e.mu.Lock()
 	e.blacklist = true
 	e.until = until
+	e.syncFastStateLocked()
 	e.mu.Unlock()
 }
 
@@ -949,7 +1048,28 @@ func (e *entry) clearBlacklist() {
 	e.mu.Lock()
 	e.blacklist = false
 	e.until = time.Time{}
+	if e.initialCheckDone && !e.available {
+		e.needsRecoveryProbe = true
+	}
+	e.syncFastStateLocked()
 	e.mu.Unlock()
+}
+
+func (e *entry) needsRecovery(now time.Time) bool {
+	e.mu.RLock()
+	defer e.mu.RUnlock()
+	return e.needsRecoveryLocked(now)
+}
+
+func (e *entry) needsRecoveryLocked(now time.Time) bool {
+	if !e.initialCheckDone || e.available {
+		return false
+	}
+	// Still actively blacklisted or cooling down — leave parked until expiry.
+	if e.blacklist && (e.until.IsZero() || now.Before(e.until)) {
+		return false
+	}
+	return e.needsRecoveryProbe || e.blacklist
 }
 
 func (e *entry) incActive() {
@@ -1066,6 +1186,7 @@ func (h *EntryHandle) MarkInitialCheckDone(available bool) {
 	h.ref.mu.Lock()
 	h.ref.initialCheckDone = true
 	h.ref.available = available
+	h.ref.syncFastStateLocked()
 	h.ref.mu.Unlock()
 }
 
@@ -1076,6 +1197,10 @@ func (h *EntryHandle) MarkAvailable(available bool) {
 	}
 	h.ref.mu.Lock()
 	h.ref.available = available
+	if available {
+		h.ref.needsRecoveryProbe = false
+	}
+	h.ref.syncFastStateLocked()
 	h.ref.mu.Unlock()
 }
 
@@ -1292,4 +1417,16 @@ func (h *EntryHandle) Available() bool {
 	h.ref.mu.RLock()
 	defer h.ref.mu.RUnlock()
 	return h.ref.initialCheckDone && h.ref.available && !(h.ref.blacklist && (h.ref.until.IsZero() || time.Now().Before(h.ref.until)))
+}
+
+// AvailableFast checks node availability without taking entry.mu.
+func (h *EntryHandle) AvailableFast(nowUnixNano int64) bool {
+	if h == nil || h.ref == nil || !h.ref.availableFast.Load() {
+		return false
+	}
+	until := h.ref.blacklistUntilNano.Load()
+	if until == 0 {
+		return true
+	}
+	return until != math.MaxInt64 && nowUnixNano >= until
 }

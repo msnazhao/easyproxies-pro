@@ -11,12 +11,16 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
 	"easy_proxies/internal/monitor"
+	"github.com/sagernet/sing-box/adapter"
+	singlog "github.com/sagernet/sing-box/log"
 	M "github.com/sagernet/sing/common/metadata"
 	N "github.com/sagernet/sing/common/network"
+	"github.com/sagernet/sing/service"
 )
 
 func localProbeResponse(t *testing.T, response string) (net.Conn, <-chan struct{}) {
@@ -196,6 +200,7 @@ func TestSessionIdentityIndexRespectsTriedHealthAndProtocol(t *testing.T) {
 				p.members[0].shared.blacklisted = true
 				p.members[0].shared.blacklistedUntil = time.Now().Add(time.Hour)
 				p.members[0].shared.manualUntil = p.members[0].shared.blacklistedUntil
+				p.members[0].shared.syncFastBanLocked()
 				p.members[0].shared.mu.Unlock()
 			}
 			member, err := p.pickMemberForSession(test.network, test.tried, "identity-a")
@@ -291,6 +296,7 @@ func TestExpiredHTTPSBlacklistStillNeedsSuccessfulProbe(t *testing.T) {
 	member.shared.mu.Lock()
 	member.shared.blacklistedUntil = time.Now().Add(-time.Second)
 	member.shared.httpsUntil = member.shared.blacklistedUntil
+	member.shared.syncFastBanLocked()
 	member.shared.mu.Unlock()
 	if _, err := p.pickMemberFiltered(N.NetworkTCP, nil, ""); err == nil {
 		t.Fatal("ordinary pool selected a node without a successful HTTPS recheck")
@@ -378,4 +384,165 @@ func TestClosingPoolCannotRemoveReplacementDialer(t *testing.T) {
 	if _, exists := GetDialer(tag); exists {
 		t.Fatal("closed pool retained a registered dialer")
 	}
+}
+
+type stalledPipeOutbound struct {
+	*sessionTestOutbound
+	t *testing.T
+}
+
+func (o *stalledPipeOutbound) DialContext(context.Context, string, M.Socksaddr) (net.Conn, error) {
+	client, server := net.Pipe()
+	o.t.Cleanup(func() {
+		_ = client.Close()
+		_ = server.Close()
+	})
+	return client, nil
+}
+
+func TestHTTPSProbeTimeoutDoesNotLockHTTPSUntil(t *testing.T) {
+	mgr, err := monitor.NewManager(monitor.Config{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer mgr.Stop()
+	entry := mgr.Register(monitor.NodeInfo{Tag: "stalled"})
+	state := &sharedMemberState{}
+	state.attachEntry(entry)
+
+	p := newSessionTestPool(nil)
+	p.options.BlacklistDuration = time.Hour
+	p.options.TransientCooldown = 5 * time.Millisecond
+	member := &memberState{
+		tag:      "stalled",
+		outbound: &stalledPipeOutbound{sessionTestOutbound: newSessionTestOutbound("stalled"), t: t},
+		entry:    entry,
+		shared:   state,
+	}
+	p.members = []*memberState{member}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 25*time.Millisecond)
+	defer cancel()
+	_, err = p.probeMember(ctx, member, M.ParseSocksaddr("localhost:443"), "localhost", true, false)
+	if err == nil {
+		t.Fatal("expected handshake timeout error")
+	}
+	state.mu.Lock()
+	httpsLocked := !state.httpsUntil.IsZero()
+	state.mu.Unlock()
+	if httpsLocked {
+		t.Fatal("HTTPS handshake timeout incorrectly locked httpsUntil")
+	}
+	time.Sleep(10 * time.Millisecond)
+	if !state.releaseIfPermanent(time.Now()) {
+		t.Fatal("node failed to auto-recover after transient TLS handshake timeout")
+	}
+}
+
+type fakeOutboundManager struct {
+	adapter.OutboundManager
+	outbounds map[string]adapter.Outbound
+}
+
+func (m *fakeOutboundManager) Outbound(tag string) (adapter.Outbound, bool) {
+	ob, ok := m.outbounds[tag]
+	return ob, ok
+}
+
+func TestSecondaryViewSkipsDuplicateMonitorRegistration(t *testing.T) {
+	mgr, err := monitor.NewManager(monitor.Config{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer mgr.Stop()
+
+	outMgr := &fakeOutboundManager{
+		outbounds: map[string]adapter.Outbound{"node-1": newSessionTestOutbound("node-1")},
+	}
+	baseCtx := service.ContextWith[adapter.OutboundManager](context.Background(), outMgr)
+	baseCtx = monitor.ContextWith(baseCtx, mgr)
+
+	secOut, err := newPool(baseCtx, nil, singlog.NewNOPFactory().Logger(), "pool-sec", Options{
+		Members:       []string{"node-1"},
+		SecondaryView: true,
+		Metadata:      map[string]MemberMeta{"node-1": {Identity: "id-sec-test", Name: "node-1"}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer secOut.(*poolOutbound).Close()
+	if got := len(mgr.Snapshot()); got != 0 {
+		t.Fatalf("SecondaryView registered %d monitor nodes, want 0", got)
+	}
+
+	priOut, err := newPool(baseCtx, nil, singlog.NewNOPFactory().Logger(), "pool-pri", Options{
+		Members:       []string{"node-1"},
+		SecondaryView: false,
+		Metadata:      map[string]MemberMeta{"node-1": {Identity: "id-sec-test", Name: "node-1"}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		sharedStateStore.Delete("id-sec-test")
+		_ = priOut.(*poolOutbound).Close()
+	}()
+	if got := len(mgr.Snapshot()); got != 1 {
+		t.Fatalf("Primary pool registered %d monitor nodes, want 1", got)
+	}
+}
+
+func TestCandidateBufferRetainsLargePoolSlices(t *testing.T) {
+	p := newSessionTestPool(nil)
+	large := make([]*memberState, 0, 8192)
+	// Go's -race runtime intentionally drops a fraction of sync.Pool items.
+	retained := false
+	for range 64 {
+		p.putCandidateBuffer(large)
+		if got := p.getCandidateBuffer(); cap(got) >= 8192 {
+			retained = true
+			break
+		}
+	}
+	if !retained {
+		t.Fatal("expected large candidate buffer >= 8192 to remain pooled")
+	}
+
+	p2 := newSessionTestPool(nil)
+	oversized := make([]*memberState, 0, maxCandidateBufferCap+1)
+	p2.putCandidateBuffer(oversized)
+	if got := p2.getCandidateBuffer(); cap(got) > maxCandidateBufferCap {
+		t.Fatalf("oversized candidate buffer %d was pooled beyond cap %d", cap(got), maxCandidateBufferCap)
+	}
+}
+
+func TestConcurrentRLockSelectionAndBlacklistMutation(t *testing.T) {
+	p := newSessionTestPool(nil,
+		newSessionTestOutbound("n1", N.NetworkTCP),
+		newSessionTestOutbound("n2", N.NetworkTCP),
+		newSessionTestOutbound("n3", N.NetworkTCP),
+	)
+	p.options.FailureThreshold = 1
+	p.options.BlacklistDuration = 50 * time.Millisecond
+
+	var wg sync.WaitGroup
+	for range 8 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for range 100 {
+				_, _ = p.pickMember(N.NetworkTCP)
+				_, _ = p.pickMemberForSession(N.NetworkTCP, nil, "identity-n1")
+			}
+		}()
+	}
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for range 50 {
+			p.recordFailure(p.members[0], errors.New("dial reset"))
+			p.members[0].shared.forceRelease()
+		}
+	}()
+	wg.Wait()
 }

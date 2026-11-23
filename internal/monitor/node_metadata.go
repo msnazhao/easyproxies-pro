@@ -27,22 +27,37 @@ type nodeMeasurements struct {
 	exitProbeFailure string
 	lastProbe        time.Duration
 	lastProbeAt      time.Time
+	lastOK           time.Time
+	healthy          bool
+	wasAvailable     bool
+	blacklisted      bool
+	blacklistedUntil time.Time
+	lastError        string
 }
 
 func (m nodeMeasurements) restore(e *entry) {
 	e.exitAttemptedAt = m.exitAttemptedAt
 	e.exitProbeFailure = m.exitProbeFailure
-	if !m.exitIP.IsValid() {
+	if m.exitIP.IsValid() {
+		copyExitMetadata(&e.info, m.info)
+		formatNodeName(&e.info)
+		e.exitIP, e.exitVerifiedAt = m.exitIP, m.exitVerifiedAt
+	}
+	if m.blacklisted {
+		e.blacklist = true
+		e.until = m.blacklistedUntil
+		e.lastError = m.lastError
+		e.initialCheckDone = true
+		e.available = m.wasAvailable
+		e.needsRecoveryProbe = !m.wasAvailable
+		e.syncFastStateLocked()
 		return
 	}
-	copyExitMetadata(&e.info, m.info)
-	formatNodeName(&e.info)
-	e.exitIP, e.exitVerifiedAt = m.exitIP, m.exitVerifiedAt
-	if m.lastProbeAt.IsZero() {
-		return
+	if m.healthy {
+		e.lastProbe, e.lastProbeAt, e.lastOK = m.lastProbe, m.lastProbeAt, m.lastOK
+		e.initialCheckDone, e.available = true, true
+		e.syncFastStateLocked()
 	}
-	e.lastProbe, e.lastProbeAt, e.lastOK = m.lastProbe, m.lastProbeAt, m.lastProbeAt
-	e.initialCheckDone, e.available = true, true
 }
 
 // Only derived fields are copied. Listen addresses, ports, URI and original

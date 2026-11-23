@@ -19,13 +19,20 @@ var (
 )
 
 func (p *poolOutbound) pickExitIP(network string, tried map[string]bool, ip netip.Addr) (*memberState, error) {
-	p.mu.Lock()
-	defer p.mu.Unlock()
+	p.mu.RLock()
 	if len(p.members) == 0 {
-		if err := p.initializeMembersLocked(); err != nil {
-			return nil, err
+		p.mu.RUnlock()
+		p.mu.Lock()
+		if len(p.members) == 0 {
+			if err := p.initializeMembersLocked(); err != nil {
+				p.mu.Unlock()
+				return nil, err
+			}
 		}
+		p.mu.Unlock()
+		p.mu.RLock()
 	}
+	defer p.mu.RUnlock()
 	now := time.Now()
 	var best *memberState
 	var bestLatency time.Duration
@@ -41,7 +48,7 @@ func (p *poolOutbound) pickExitIP(network string, tried map[string]bool, ip neti
 		if network != "" && !common.Contains(member.outbound.Network(), network) {
 			continue
 		}
-		if member.shared != nil && member.shared.isBlacklisted(now) {
+		if member.shared != nil && member.shared.isBlacklistedFast(now) {
 			continue
 		}
 		fresh := member.entry.ExitRouteLatency(ip, now) > 0

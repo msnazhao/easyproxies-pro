@@ -2,6 +2,7 @@ package monitor
 
 import (
 	"bufio"
+	"compress/gzip"
 	"context"
 	"crypto/rand"
 	"crypto/sha256"
@@ -11,6 +12,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log"
 	mathrand "math/rand"
 	"net"
@@ -381,7 +383,7 @@ func (s *Server) handleNodes(w http.ResponseWriter, r *http.Request) {
 			"failed":    sweepFail,
 		},
 	}
-	writeJSON(w, payload)
+	writeCompressedJSON(w, r, payload)
 }
 
 func (s *Server) handleDebug(w http.ResponseWriter, r *http.Request) {
@@ -415,7 +417,7 @@ func (s *Server) handleDebug(w http.ResponseWriter, r *http.Request) {
 	if totalCalls > 0 {
 		successRate = float64(totalSuccess) / float64(totalCalls) * 100
 	}
-	writeJSON(w, map[string]any{
+	writeCompressedJSON(w, r, map[string]any{
 		"nodes":         debugNodes,
 		"total_calls":   totalCalls,
 		"total_success": totalSuccess,
@@ -678,6 +680,48 @@ func writeSSE(w http.ResponseWriter, data []byte) error {
 		return err
 	}
 	return controller.Flush()
+}
+
+var gzipWriterPool = sync.Pool{
+	New: func() any {
+		w, _ := gzip.NewWriterLevel(io.Discard, gzip.BestSpeed)
+		return w
+	},
+}
+
+func acceptsGzip(r *http.Request) bool {
+	return r != nil && strings.Contains(strings.ToLower(r.Header.Get("Accept-Encoding")), "gzip")
+}
+
+func writeCompressedJSON(w http.ResponseWriter, r *http.Request, payload any) {
+	w.Header().Set("Content-Type", "application/json")
+	w.Header().Add("Vary", "Accept-Encoding")
+	if !acceptsGzip(r) {
+		_ = json.NewEncoder(w).Encode(payload)
+		return
+	}
+	w.Header().Set("Content-Encoding", "gzip")
+	gz := gzipWriterPool.Get().(*gzip.Writer)
+	gz.Reset(w)
+	_ = json.NewEncoder(gz).Encode(payload)
+	_ = gz.Close()
+	gz.Reset(io.Discard)
+	gzipWriterPool.Put(gz)
+}
+
+func writeCompressedText(w http.ResponseWriter, r *http.Request, text string) {
+	w.Header().Add("Vary", "Accept-Encoding")
+	if !acceptsGzip(r) {
+		_, _ = io.WriteString(w, text)
+		return
+	}
+	w.Header().Set("Content-Encoding", "gzip")
+	gz := gzipWriterPool.Get().(*gzip.Writer)
+	gz.Reset(w)
+	_, _ = io.WriteString(gz, text)
+	_ = gz.Close()
+	gz.Reset(io.Discard)
+	gzipWriterPool.Put(gz)
 }
 
 func writeJSON(w http.ResponseWriter, payload any) {
@@ -951,7 +995,7 @@ func (s *Server) handleExport(w http.ResponseWriter, r *http.Request) {
 		filename = "full_" + filename
 	}
 	w.Header().Set("Content-Disposition", fmt.Sprintf("attachment; filename=%s", filename))
-	_, _ = w.Write([]byte(strings.Join(lines, "\n")))
+	writeCompressedText(w, r, strings.Join(lines, "\n"))
 }
 
 // handleSettings handles GET/PUT for dynamic settings (external_ip, probe_target, skip_cert_verify, log).
@@ -1538,7 +1582,7 @@ func (s *Server) handleConfigNodes(w http.ResponseWriter, r *http.Request) {
 			s.respondNodeError(w, err)
 			return
 		}
-		writeJSON(w, map[string]any{"nodes": nodes})
+		writeCompressedJSON(w, r, map[string]any{"nodes": nodes})
 	case http.MethodPost:
 		var payload nodePayload
 		if err := decodeManagementJSON(w, r, 1<<20, &payload); err != nil {

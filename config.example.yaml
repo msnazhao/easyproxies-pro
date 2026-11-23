@@ -153,6 +153,10 @@ geoip:
 #   health_check_timeout: 60s   # 新节点健康检查超时
 #   drain_timeout: 30s          # 旧实例排空超时时间
 #   min_available_nodes: 1      # 最少可用节点数，低于此值不切换
+#   prescreen_enabled: true     # 入核前快速预筛选（省略时节点数 >= prescreen_threshold 自动启用）
+#   prescreen_threshold: 50     # 自动触发预筛选的节点数量阈值
+#   prescreen_concurrency: 256  # DNS/TCP 预筛选并发度（默认 256，最大 1024）
+#   prescreen_timeout: 2s       # 预筛选单次 DNS/TCP 拨号超时
 
 # ═══════════════════════════════════════════════════════════════
 # 节点配置方式（三选一或混合使用）

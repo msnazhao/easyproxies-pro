@@ -2,13 +2,16 @@ package main
 
 import (
 	"context"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
 	"log"
 	"os"
+	"os/signal"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"time"
 
 	"easy_proxies/internal/app"
@@ -23,17 +26,29 @@ func main() {
 	flag.StringVar(&configPath, "config", "config.yaml", "path to config file")
 	flag.Parse()
 
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer stop()
+
 	var cfg *config.Config
 	for attempt := 1; attempt <= 3; attempt++ {
 		var err error
-		cfg, err = config.Load(configPath)
+		cfg, err = config.LoadContext(ctx, configPath)
 		if err == nil {
 			break
 		}
+		if ctx.Err() != nil || errors.Is(err, context.Canceled) {
+			log.Println("Received shutdown signal during startup, exiting cleanly")
+			return
+		}
 		if attempt < 3 && strings.Contains(err.Error(), "config.nodes cannot be empty") {
 			log.Printf("⚠️  Attempt %d/3: %v (retrying in %ds...)", attempt, err, attempt*10)
-			time.Sleep(time.Duration(attempt*10) * time.Second)
-			continue
+			select {
+			case <-ctx.Done():
+				log.Println("Received shutdown signal while waiting to retry config load, exiting cleanly")
+				return
+			case <-time.After(time.Duration(attempt*10) * time.Second):
+				continue
+			}
 		}
 		log.Fatalf("load config: %v", err)
 	}
@@ -41,10 +56,10 @@ func main() {
 	// Setup logging based on config
 	setupLogging(cfg)
 
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-
 	if err := app.Run(ctx, cfg); err != nil {
+		if ctx.Err() != nil && errors.Is(err, context.Canceled) {
+			return
+		}
 		fmt.Fprintf(os.Stderr, "proxy pool exited with error: %v\n", err)
 		os.Exit(1)
 	}

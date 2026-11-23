@@ -1,10 +1,19 @@
 package config
 
 import (
+	"context"
 	"encoding/base64"
+	"errors"
+	"net/http"
+	"net/http/httptest"
 	"net/url"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
+	"time"
+
+	"gopkg.in/yaml.v3"
 )
 
 func TestSubscriptionBase64Variants(t *testing.T) {
@@ -70,5 +79,115 @@ func TestValidateSettingsRejectsInvalidValues(t *testing.T) {
 	}
 	if strings.Contains(buildTrojanURI(clashProxy{Password: "x#secret", Server: "fixture.invalid", Port: 443}), "x#secret") {
 		t.Fatal("password must be encoded")
+	}
+}
+
+func TestDNSConfigAndPreScreenDefaultsAndValidation(t *testing.T) {
+	raw := `
+mode: pool
+dns:
+  server: https://1.1.1.1/dns-query
+  fallback_servers:
+    - 8.8.8.8
+    - local
+  port: 53
+  strategy: prefer_ipv4
+subscription_refresh:
+  prescreen_enabled: false
+  prescreen_threshold: 80
+  prescreen_concurrency: 512
+  prescreen_timeout: 3s
+`
+	var cfg Config
+	if err := yaml.Unmarshal([]byte(raw), &cfg); err != nil {
+		t.Fatal(err)
+	}
+	if cfg.DNS.Server != "https://1.1.1.1/dns-query" || len(cfg.DNS.FallbackServers) != 2 || cfg.DNS.Strategy != "prefer_ipv4" {
+		t.Fatalf("unexpected DNS config: %+v", cfg.DNS)
+	}
+	if err := cfg.ValidateManagementSettings(); err != nil {
+		t.Fatalf("valid DNS/prescreen config rejected: %v", err)
+	}
+	if cfg.SubscriptionRefresh.PreScreenEnabledFor(500) {
+		t.Fatal("explicit prescreen_enabled=false should stay disabled for 500 nodes")
+	}
+	if cfg.SubscriptionRefresh.PreScreenConcurrencyOrDefault() != 512 || cfg.SubscriptionRefresh.PreScreenTimeoutOrDefault() != 3*time.Second {
+		t.Fatalf("unexpected prescreen settings: %+v", cfg.SubscriptionRefresh)
+	}
+
+	auto := SubscriptionRefreshConfig{}
+	if auto.PreScreenEnabledFor(49) || !auto.PreScreenEnabledFor(50) {
+		t.Fatal("auto prescreen threshold should trigger at 50 nodes")
+	}
+	if got := (SubscriptionRefreshConfig{PreScreenConcurrency: 9999}).PreScreenConcurrencyOrDefault(); got != maxPreScreenConcurrency {
+		t.Fatalf("expected concurrency clamped to %d, got %d", maxPreScreenConcurrency, got)
+	}
+
+	for _, mutate := range []func(*Config){
+		func(c *Config) { c.DNS.Strategy = "bad_strategy" },
+		func(c *Config) { c.SubscriptionRefresh.PreScreenConcurrency = 2048 },
+		func(c *Config) { c.SubscriptionRefresh.PreScreenTimeout = -time.Second },
+	} {
+		invalid := &Config{Mode: "pool"}
+		mutate(invalid)
+		if invalid.ValidateManagementSettings() == nil {
+			t.Fatal("invalid DNS/prescreen config was accepted")
+		}
+	}
+}
+
+func TestLoadContextRespectsCancellation(t *testing.T) {
+	started := make(chan struct{})
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		close(started)
+		<-r.Context().Done()
+	}))
+	defer srv.Close()
+
+	dir := t.TempDir()
+	cfgPath := filepath.Join(dir, "config.yaml")
+	if err := os.WriteFile(cfgPath, []byte("mode: pool\nsubscriptions:\n  - "+srv.URL+"/sub\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go func() {
+		<-started
+		cancel()
+	}()
+
+	start := time.Now()
+	_, err := LoadContext(ctx, cfgPath)
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("LoadContext error = %v, want context.Canceled", err)
+	}
+	if time.Since(start) > 2*time.Second {
+		t.Fatalf("LoadContext took too long to abort: %s", time.Since(start))
+	}
+}
+
+func TestLoadResolvesRelativeGeoIPDatabasePath(t *testing.T) {
+	dir := t.TempDir()
+	cfgPath := filepath.Join(dir, "config.yaml")
+	raw := `
+mode: pool
+geoip:
+  enabled: false
+  database_path: "./GeoLite2-Country.mmdb"
+nodes:
+  - name: "n"
+    uri: "http://127.0.0.1:8080"
+`
+	if err := os.WriteFile(cfgPath, []byte(raw), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := Load(cfgPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := filepath.Join(dir, "GeoLite2-Country.mmdb")
+	if cfg.GeoIP.DatabasePath != want {
+		t.Fatalf("GeoIP.DatabasePath = %q, want %q", cfg.GeoIP.DatabasePath, want)
 	}
 }

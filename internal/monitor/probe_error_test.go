@@ -2,8 +2,10 @@ package monitor
 
 import (
 	"context"
+	"encoding/base64"
 	"errors"
 	"fmt"
+	"strings"
 	"testing"
 )
 
@@ -68,5 +70,27 @@ func TestClassifyProbeError_DialSignalWinsOverCancellation(t *testing.T) {
 	err := errors.New("dial tcp 1.2.3.4:443: operation was canceled")
 	if cat, _ := classifyProbeError(err); cat == "cancelled" {
 		t.Errorf("dial-stage failure must not be classified as cancelled, got cancelled")
+	}
+}
+
+func TestNodeBriefRedactsVMessBase64AndExtractsHostPort(t *testing.T) {
+	vmessJSON := `{"v":"2","ps":"secret-node","add":"203.0.113.10","port":"8443","id":"11111111-2222-3333-4444-555555555555"}`
+	vmessURI := "vmess://" + base64.StdEncoding.EncodeToString([]byte(vmessJSON))
+	if got := nodeBrief(vmessURI); got != "vmess@203.0.113.10:8443" {
+		t.Fatalf("vmess nodeBrief = %q, want vmess@203.0.113.10:8443", got)
+	}
+	if strings.Contains(nodeBrief(vmessURI), "11111111") {
+		t.Fatal("vmess nodeBrief leaked UUID")
+	}
+	for _, secretURI := range []string{
+		"ssr://" + base64.RawURLEncoding.EncodeToString([]byte("1.2.3.4:443:origin:aes-256-cfb:plain:cGFzcw")),
+		"ss://" + base64.StdEncoding.EncodeToString([]byte("aes-256-gcm:secret@1.2.3.4:8388")),
+	} {
+		if got := nodeBrief(secretURI); got != "" {
+			t.Fatalf("legacy base64 URI %q should return empty brief, got %q", secretURI, got)
+		}
+	}
+	if got := nodeBrief("vless://secret-uuid@example.com:443?type=ws#name"); got != "vless@example.com:443" {
+		t.Fatalf("vless nodeBrief = %q", got)
 	}
 }

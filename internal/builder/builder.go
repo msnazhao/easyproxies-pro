@@ -11,9 +11,9 @@ import (
 	"net"
 	"net/netip"
 	"net/url"
+	"path/filepath"
 	"strconv"
 	"strings"
-	"sync"
 	"time"
 
 	"easy_proxies/internal/config"
@@ -39,6 +39,12 @@ func SubscriptionOutbound(tag, uri string, skipCertVerify bool) ([]byte, error) 
 	return singjson.MarshalContext(context.Background(), &outbound)
 }
 
+// ValidateNodeURI verifies that rawURI parses into a supported sing-box outbound.
+func ValidateNodeURI(rawURI string, skipCertVerify bool) error {
+	_, err := buildNodeOutbound("validate", strings.TrimSpace(rawURI), skipCertVerify)
+	return err
+}
+
 // Build converts high level config into sing-box Options tree.
 func Build(cfg *config.Config) (option.Options, error) {
 	if cfg == nil {
@@ -52,16 +58,20 @@ func Build(cfg *config.Config) (option.Options, error) {
 
 	// Initialize GeoIP lookup if enabled
 	var geoLookup *geoip.Lookup
-	if cfg.GeoIP.Enabled && cfg.GeoIP.DatabasePath != "" {
+	geoDBPath := strings.TrimSpace(cfg.GeoIP.DatabasePath)
+	if geoDBPath != "" && !filepath.IsAbs(geoDBPath) && cfg.FilePath() != "" {
+		geoDBPath = filepath.Join(filepath.Dir(cfg.FilePath()), geoDBPath)
+	}
+	if cfg.GeoIP.Enabled && geoDBPath != "" {
 		var err error
 		// This lookup only lives during option construction. A periodic updater
 		// tied to it would stop before the first update and imply false support.
-		geoLookup, err = geoip.New(cfg.GeoIP.DatabasePath)
+		geoLookup, err = geoip.New(geoDBPath)
 		if err != nil {
 			log.Printf("⚠️  GeoIP database load failed: %v (region routing disabled)", err)
 		} else {
 			defer geoLookup.Close()
-			log.Printf("✅ GeoIP database loaded: %s", cfg.GeoIP.DatabasePath)
+			log.Printf("✅ GeoIP database loaded: %s", geoDBPath)
 		}
 	}
 
@@ -120,70 +130,19 @@ func Build(cfg *config.Config) (option.Options, error) {
 		metadata[tag] = meta
 	}
 
-	// Concurrent GeoIP resolution
+	// Concurrent GeoIP resolution (literal IP / cache only, avoiding synchronous DNS blocking)
 	if geoLookup != nil && geoLookup.IsEnabled() {
 		geoStart := time.Now()
-		log.Printf("🌍 Resolving GeoIP for %d nodes (concurrent)...", len(memberTags))
-
-		type geoResult struct {
-			index  int
-			tag    string
-			region geoip.RegionInfo
-		}
-
-		results := make(chan geoResult, len(memberTags))
-		var wg sync.WaitGroup
-
-		// Worker pool: min(32, len(memberTags))
-		workerCount := 32
-		if len(memberTags) < workerCount {
-			workerCount = len(memberTags)
-		}
-
-		// Job channel
-		type geoJob struct {
-			index int
-			tag   string
-			uri   string
-		}
-		jobs := make(chan geoJob, len(memberTags))
-
-		// Start workers
-		for w := 0; w < workerCount; w++ {
-			wg.Add(1)
-			go func() {
-				defer wg.Done()
-				for job := range jobs {
-					region := geoLookup.LookupURI(job.uri)
-					results <- geoResult{index: job.index, tag: job.tag, region: region}
-				}
-			}()
-		}
-
-		// Send jobs
-		for i, tag := range memberTags {
+		for _, tag := range memberTags {
 			meta := metadata[tag]
-			jobs <- geoJob{index: i, tag: tag, uri: meta.URI}
-		}
-		close(jobs)
-
-		// Wait for completion and close results
-		go func() {
-			wg.Wait()
-			close(results)
-		}()
-
-		// Collect results
-		for res := range results {
-			meta := metadata[res.tag]
-			meta.EntryCountry = res.region.Country
-			meta.EntryISO = res.region.ISOCode
+			region := geoLookup.LookupURIWithoutDNS(meta.URI)
+			meta.EntryCountry = region.Country
+			meta.EntryISO = region.ISOCode
 			meta.Region = geoip.RegionOther // Unclassified until an exit is observed.
-			metadata[res.tag] = meta
-			regionMembers[res.region.Code] = append(regionMembers[res.region.Code], res.tag)
+			metadata[tag] = meta
+			regionMembers[region.Code] = append(regionMembers[region.Code], tag)
 		}
-
-		log.Printf("🌍 GeoIP resolution completed in %.1fs", time.Since(geoStart).Seconds())
+		log.Printf("🌍 Entry GeoIP resolution completed in %.3fs", time.Since(geoStart).Seconds())
 	} else {
 		// No GeoIP - assign all to "other" region
 		for _, tag := range memberTags {
@@ -280,6 +239,7 @@ func Build(cfg *config.Config) (option.Options, error) {
 				RetryAttempts:      cfg.Pool.RetryAttempts,
 				Metadata:           metadata,
 				Sticky:             true,
+				SecondaryView:      true,
 			}
 			outbounds = append(outbounds, option.Outbound{
 				Type:    poolout.Type,
@@ -324,6 +284,7 @@ func Build(cfg *config.Config) (option.Options, error) {
 				BlacklistFailedPin: cfg.Pool.BlacklistFailedPin,
 				RetryAttempts:      cfg.Pool.RetryAttempts,
 				Metadata:           perMeta,
+				SecondaryView:      enablePoolInbound,
 			}
 			perPool := option.Outbound{
 				Type:    poolout.Type,
@@ -370,19 +331,11 @@ func Build(cfg *config.Config) (option.Options, error) {
 		// All region pools observe the same nodes; membership follows measured
 		// exit location at dial time instead of the server's GeoIP at build time.
 		for _, region := range geoip.AllRegions() {
-			members := memberTags
-
-			// Build metadata for this region's members
-			regionMeta := make(map[string]poolout.MemberMeta)
-			for _, tag := range members {
-				regionMeta[tag] = metadata[tag]
-			}
-
 			regionPoolTag := fmt.Sprintf("pool-%s", region)
 			regionPoolOptions := poolout.Options{
 				Region:             region,
 				Mode:               cfg.Pool.Mode,
-				Members:            members,
+				Members:            memberTags,
 				FailureThreshold:   cfg.Pool.FailureThreshold,
 				BlacklistDuration:  cfg.Pool.BlacklistDuration,
 				TransientCooldown:  cfg.Pool.TransientCooldown,
@@ -390,7 +343,8 @@ func Build(cfg *config.Config) (option.Options, error) {
 				RetryEnabled:       cfg.Pool.RetryEnabledOrDefault(),
 				BlacklistFailedPin: cfg.Pool.BlacklistFailedPin,
 				RetryAttempts:      cfg.Pool.RetryAttempts,
-				Metadata:           regionMeta,
+				Metadata:           metadata,
+				SecondaryView:      true,
 			}
 			outbounds = append(outbounds, option.Outbound{
 				Type:    poolout.Type,
@@ -416,6 +370,7 @@ func Build(cfg *config.Config) (option.Options, error) {
 
 	opts := option.Options{
 		Log:       &option.LogOptions{Level: strings.ToLower(cfg.LogLevel)},
+		DNS:       buildDNSOptions(cfg),
 		Inbounds:  inbounds,
 		Outbounds: outbounds,
 		Route:     &route,
@@ -430,6 +385,159 @@ func Build(cfg *config.Config) (option.Options, error) {
 		}
 	}
 	return opts, nil
+}
+
+func buildDNSOptions(cfg *config.Config) *option.DNSOptions {
+	if cfg == nil {
+		return nil
+	}
+	server := strings.TrimSpace(cfg.DNS.Server)
+	strategy := parseDomainStrategy(cfg.DNS.Strategy)
+	var servers []option.DNSServerOptions
+	needsLocalResolver := false
+
+	appendServer := func(tag, raw string, defaultPort uint16) bool {
+		raw = strings.TrimSpace(raw)
+		if raw == "" {
+			return false
+		}
+		if strings.EqualFold(raw, "local") {
+			servers = append(servers, option.DNSServerOptions{
+				Type:    C.DNSTypeLocal,
+				Tag:     tag,
+				Options: &option.LocalDNSServerOptions{},
+			})
+			return true
+		}
+		dnsType := C.DNSTypeUDP
+		hostPortStr := raw
+		if strings.Contains(raw, "://") {
+			u, err := url.Parse(raw)
+			if err != nil || u.Hostname() == "" {
+				return false
+			}
+			switch strings.ToLower(u.Scheme) {
+			case "udp", "tcp", "tls", "https":
+				dnsType = strings.ToLower(u.Scheme)
+			default:
+				return false
+			}
+			hostPortStr = u.Host
+		}
+		host, portStr, err := net.SplitHostPort(hostPortStr)
+		var port uint16
+		if err == nil {
+			if p, convErr := strconv.Atoi(portStr); convErr == nil && p > 0 && p <= 65535 {
+				port = uint16(p)
+			}
+		} else {
+			host = strings.Trim(hostPortStr, "[]")
+			port = defaultPort
+		}
+		if host == "" {
+			return false
+		}
+		if port == 0 {
+			switch dnsType {
+			case C.DNSTypeTLS:
+				port = 853
+			case C.DNSTypeHTTPS:
+				port = 443
+			default:
+				port = 53
+			}
+		}
+		remoteOpts := option.RemoteDNSServerOptions{
+			DNSServerAddressOptions: option.DNSServerAddressOptions{
+				Server:     host,
+				ServerPort: port,
+			},
+		}
+		if net.ParseIP(host) == nil {
+			needsLocalResolver = true
+			remoteOpts.DialerOptions.DomainResolver = &option.DomainResolveOptions{Server: "dns-local"}
+		}
+		switch dnsType {
+		case C.DNSTypeTLS:
+			servers = append(servers, option.DNSServerOptions{
+				Type:    C.DNSTypeTLS,
+				Tag:     tag,
+				Options: &option.RemoteTLSDNSServerOptions{RemoteDNSServerOptions: remoteOpts},
+			})
+		case C.DNSTypeHTTPS:
+			servers = append(servers, option.DNSServerOptions{
+				Type: C.DNSTypeHTTPS,
+				Tag:  tag,
+				Options: &option.RemoteHTTPSDNSServerOptions{
+					RemoteTLSDNSServerOptions: option.RemoteTLSDNSServerOptions{RemoteDNSServerOptions: remoteOpts},
+				},
+			})
+		default:
+			servers = append(servers, option.DNSServerOptions{
+				Type:    dnsType,
+				Tag:     tag,
+				Options: &remoteOpts,
+			})
+		}
+		return true
+	}
+
+	mainTag := ""
+	if server != "" && appendServer("dns-main", server, cfg.DNS.Port) {
+		mainTag = "dns-main"
+	}
+	for i, fb := range cfg.DNS.FallbackServers {
+		tag := fmt.Sprintf("dns-fallback-%d", i)
+		if mainTag == "" {
+			tag = "dns-main"
+		}
+		if appendServer(tag, fb, cfg.DNS.Port) && mainTag == "" {
+			mainTag = tag
+		}
+	}
+	if needsLocalResolver {
+		servers = append(servers, option.DNSServerOptions{
+			Type:    C.DNSTypeLocal,
+			Tag:     "dns-local",
+			Options: &option.LocalDNSServerOptions{},
+		})
+	}
+	if len(servers) == 0 && strategy == option.DomainStrategy(C.DomainStrategyAsIS) {
+		return nil
+	}
+	if len(servers) == 0 {
+		mainTag = "dns-local"
+		servers = append(servers, option.DNSServerOptions{
+			Type:    C.DNSTypeLocal,
+			Tag:     mainTag,
+			Options: &option.LocalDNSServerOptions{},
+		})
+	}
+	return &option.DNSOptions{
+		RawDNSOptions: option.RawDNSOptions{
+			Servers: servers,
+			Final:   mainTag,
+			DNSClientOptions: option.DNSClientOptions{
+				Strategy:         strategy,
+				IndependentCache: true,
+			},
+		},
+	}
+}
+
+func parseDomainStrategy(strategy string) option.DomainStrategy {
+	switch strings.ToLower(strings.TrimSpace(strategy)) {
+	case "prefer_ipv4":
+		return option.DomainStrategy(C.DomainStrategyPreferIPv4)
+	case "prefer_ipv6":
+		return option.DomainStrategy(C.DomainStrategyPreferIPv6)
+	case "ipv4_only":
+		return option.DomainStrategy(C.DomainStrategyIPv4Only)
+	case "ipv6_only":
+		return option.DomainStrategy(C.DomainStrategyIPv6Only)
+	default:
+		return option.DomainStrategy(C.DomainStrategyAsIS)
+	}
 }
 
 func buildPoolInbound(cfg *config.Config) (option.Inbound, error) {
@@ -1504,6 +1612,8 @@ func printProxyLinks(cfg *config.Config, metadata map[string]poolout.MemberMeta)
 	showPoolEntry := cfg.Mode == "pool" || cfg.Mode == "hybrid"
 	showMultiPort := cfg.Mode == "multi-port" || cfg.Mode == "hybrid"
 
+	const maxLoggedProxyLinks = 20
+
 	if showPoolEntry {
 		// Pool mode: single entry point for all nodes
 		httpProxyURL := maskedProxyURL("http", cfg.Listener.Address, cfg.Listener.Port, cfg.Listener.Username)
@@ -1516,8 +1626,14 @@ func printProxyLinks(cfg *config.Config, metadata map[string]poolout.MemberMeta)
 		}
 		log.Println("")
 		log.Printf("   Nodes in pool (%d):", len(metadata))
+		logged := 0
 		for _, meta := range metadata {
+			if logged >= maxLoggedProxyLinks {
+				log.Printf("   • ... and %d more nodes (view all in WebUI)", len(metadata)-maxLoggedProxyLinks)
+				break
+			}
 			log.Printf("   • %s", meta.Name)
+			logged++
 		}
 		if cfg.Sticky.Enabled {
 			log.Println("")
@@ -1536,7 +1652,11 @@ func printProxyLinks(cfg *config.Config, metadata map[string]poolout.MemberMeta)
 		// Multi-port mode: each node has its own port
 		log.Printf("🔌 Multi-Port Entry Points (%d nodes):", len(cfg.Nodes))
 		log.Println("")
-		for _, node := range cfg.Nodes {
+		for idx, node := range cfg.Nodes {
+			if idx >= maxLoggedProxyLinks {
+				log.Printf("   ... and %d more multi-port entry points (view all in WebUI)", len(cfg.Nodes)-maxLoggedProxyLinks)
+				break
+			}
 			username := node.Username
 			if username == "" {
 				username = cfg.MultiPort.Username

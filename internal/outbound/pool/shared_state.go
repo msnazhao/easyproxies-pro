@@ -1,6 +1,7 @@
 package pool
 
 import (
+	"math"
 	"regexp"
 	"strings"
 	"sync"
@@ -26,9 +27,10 @@ type sharedMemberState struct {
 	manualUntil time.Time
 	// A failed HTTPS health check is a security failure, not a recoverable
 	// transport fault. Keep its ban through successful probes and pool recovery.
-	httpsUntil time.Time
-	entry      atomic.Pointer[monitor.EntryHandle]
-	active     atomic.Int32
+	httpsUntil         time.Time
+	blacklistUntilNano atomic.Int64
+	entry              atomic.Pointer[monitor.EntryHandle]
+	active             atomic.Int32
 }
 
 // failureKind classifies a dial failure so the caller can pick the right
@@ -141,7 +143,71 @@ func ResetSharedStateStore() {
 		sharedStateStore.Delete(key)
 		return true
 	})
+	exitLookupErrors.Store(0)
 	ResetDialerRegistry()
+}
+
+// RetainSharedStateForKeys preserves active bans/cooldowns for surviving node
+// identities across a reload while removing dropped nodes and resetting stale
+// entry handles and active connection counts.
+func RetainSharedStateForKeys(keepKeys map[string]struct{}) {
+	now := time.Now()
+	sharedStateStore.Range(func(key, val any) bool {
+		k, ok := key.(string)
+		if !ok {
+			sharedStateStore.Delete(key)
+			return true
+		}
+		if _, keep := keepKeys[k]; !keep {
+			sharedStateStore.Delete(key)
+			return true
+		}
+		state := val.(*sharedMemberState)
+		state.entry.Store(nil)
+		state.active.Store(0)
+		state.mu.Lock()
+		expired := state.blacklisted && !state.blacklistedUntil.IsZero() && !now.Before(state.blacklistedUntil)
+		if expired {
+			state.blacklisted = false
+			state.blacklistedUntil = time.Time{}
+			state.banIsCooldown = false
+			state.manualUntil = time.Time{}
+			state.httpsUntil = time.Time{}
+			state.syncFastBanLocked()
+		}
+		hasState := state.blacklisted || state.failures > 0
+		state.mu.Unlock()
+		if !hasState {
+			sharedStateStore.Delete(key)
+		}
+		return true
+	})
+	exitLookupErrors.Store(0)
+	ResetDialerRegistry()
+}
+
+func (s *sharedMemberState) syncFastBanLocked() {
+	if !s.blacklisted {
+		s.blacklistUntilNano.Store(0)
+		return
+	}
+	if s.blacklistedUntil.IsZero() {
+		s.blacklistUntilNano.Store(math.MaxInt64)
+		return
+	}
+	s.blacklistUntilNano.Store(s.blacklistedUntil.UnixNano())
+}
+
+func (s *sharedMemberState) manualBlacklist(duration time.Duration) {
+	until := time.Now().Add(duration)
+	s.mu.Lock()
+	s.blacklisted = true
+	s.blacklistedUntil = until
+	s.banIsCooldown = false // an operator-issued ban is not a cooldown
+	s.manualUntil = until
+	s.failures = 0
+	s.syncFastBanLocked()
+	s.mu.Unlock()
 }
 
 func (s *sharedMemberState) attachEntry(entry *monitor.EntryHandle) {
@@ -197,6 +263,7 @@ func (s *sharedMemberState) recordFailure(cause error, policy failurePolicy) (in
 		s.blacklisted = true
 		s.blacklistedUntil = until
 		s.banIsCooldown = cooldown
+		s.syncFastBanLocked()
 	}
 	s.mu.Unlock()
 
@@ -228,6 +295,7 @@ func (s *sharedMemberState) blacklistNow(cause error, policy failurePolicy, http
 	if httpsFailure && until.After(s.httpsUntil) {
 		s.httpsUntil = until
 	}
+	s.syncFastBanLocked()
 	s.mu.Unlock()
 
 	if entry := s.entry.Load(); entry != nil {
@@ -249,6 +317,18 @@ func (s *sharedMemberState) recordSuccess() {
 	}
 }
 
+// isBlacklistedFast checks blacklist status lock-free on the common unbanned/active path.
+func (s *sharedMemberState) isBlacklistedFast(now time.Time) bool {
+	until := s.blacklistUntilNano.Load()
+	if until == 0 {
+		return false
+	}
+	if until == math.MaxInt64 || now.UnixNano() < until {
+		return true
+	}
+	return s.isBlacklisted(now)
+}
+
 // isBlacklisted checks if the node is currently blacklisted, auto-clearing if expired.
 func (s *sharedMemberState) isBlacklisted(now time.Time) bool {
 	s.mu.Lock()
@@ -259,6 +339,7 @@ func (s *sharedMemberState) isBlacklisted(now time.Time) bool {
 		s.banIsCooldown = false
 		s.manualUntil = time.Time{}
 		s.httpsUntil = time.Time{}
+		s.syncFastBanLocked()
 	}
 	blacklisted := s.blacklisted
 	s.mu.Unlock()
@@ -299,6 +380,7 @@ func (s *sharedMemberState) forceRelease() {
 	s.banIsCooldown = false
 	s.manualUntil = time.Time{}
 	s.httpsUntil = time.Time{}
+	s.syncFastBanLocked()
 	s.mu.Unlock()
 
 	if entry := s.entry.Load(); entry != nil {
@@ -323,6 +405,7 @@ func (s *sharedMemberState) releaseIfPermanent(now time.Time) bool {
 	s.banIsCooldown = false
 	s.manualUntil = time.Time{}
 	s.httpsUntil = time.Time{}
+	s.syncFastBanLocked()
 	s.mu.Unlock()
 
 	if entry := s.entry.Load(); entry != nil {
@@ -353,13 +436,6 @@ func releaseSharedMember(tag string) {
 // blacklistSharedMember manually blacklists a node in pool shared state.
 func blacklistSharedMember(tag string, duration time.Duration) {
 	if state, ok := lookupSharedState(tag); ok {
-		until := time.Now().Add(duration)
-		state.mu.Lock()
-		state.blacklisted = true
-		state.blacklistedUntil = until
-		state.banIsCooldown = false // an operator-issued ban is not a cooldown
-		state.manualUntil = until
-		state.failures = 0
-		state.mu.Unlock()
+		state.manualBlacklist(duration)
 	}
 }

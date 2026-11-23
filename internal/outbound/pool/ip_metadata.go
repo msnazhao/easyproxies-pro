@@ -23,6 +23,50 @@ import (
 var errExitProbeMismatch = errors.New("exit probes disagree")
 var errExitProbeRateLimited = errors.New("exit probe rate limited")
 
+type exitLookupTask struct {
+	member *memberState
+	used   bool
+}
+
+const exitLookupWorkerCount = 16
+
+func (p *poolOutbound) startExitLookupWorkers() {
+	p.exitLookupOnce.Do(func() {
+		bufSize := max(64, min(16384, len(p.options.Members)))
+		p.exitLookupCh = make(chan exitLookupTask, bufSize)
+		workers := min(exitLookupWorkerCount, max(1, len(p.options.Members)))
+		for range workers {
+			go p.exitLookupWorker()
+		}
+	})
+}
+
+func (p *poolOutbound) exitLookupWorker() {
+	for {
+		select {
+		case <-p.ctx.Done():
+			for {
+				select {
+				case task := <-p.exitLookupCh:
+					if task.member != nil && task.member.entry != nil {
+						task.member.entry.EndExitLookup("canceled")
+					}
+				default:
+					return
+				}
+			}
+		case task := <-p.exitLookupCh:
+			if p.ctx.Err() != nil {
+				if task.member != nil && task.member.entry != nil {
+					task.member.entry.EndExitLookup("canceled")
+				}
+				continue
+			}
+			p.runExitLookup(task.member, task.used)
+		}
+	}
+}
+
 func (p *poolOutbound) scheduleExitLookup(member *memberState, used bool) <-chan struct{} {
 	entry := member.entry
 	if entry == nil || p.ctx.Err() != nil {
@@ -30,7 +74,12 @@ func (p *poolOutbound) scheduleExitLookup(member *memberState, used bool) <-chan
 	}
 	done, start := entry.QueueExitLookup(used)
 	if start {
-		go p.runExitLookup(member, used)
+		p.startExitLookupWorkers()
+		select {
+		case p.exitLookupCh <- exitLookupTask{member: member, used: used}:
+		default:
+			entry.EndExitLookup("canceled")
+		}
 	}
 	return done
 }
@@ -80,21 +129,270 @@ func (p *poolOutbound) runExitLookup(member *memberState, used bool) {
 	if count := exitLookupErrors.Add(1); count <= 5 {
 		log.Printf("[pool] exit lookup failed for %s: %v", member.tag, err)
 	} else if count == 6 {
-		log.Printf("[pool] further exit lookup errors suppressed")
+		log.Printf("[pool] exit lookup errors exceeded 5, suppressing further per-node warnings until next reload")
+	}
+}
+
+type exitProbeConfig struct {
+	CFTraceV4URL        string
+	CFTraceV6URL        string
+	CFTraceDualURL      string
+	VerifyV4URLs        []string
+	VerifyV6URLs        []string
+	FallbackEchoURL     string
+	FallbackLocationURL string
+}
+
+func defaultExitProbeConfig() exitProbeConfig {
+	return exitProbeConfig{
+		CFTraceV4URL:        "https://1.1.1.1/cdn-cgi/trace",
+		CFTraceV6URL:        "https://[2606:4700:4700::1111]/cdn-cgi/trace",
+		CFTraceDualURL:      "https://www.cloudflare.com/cdn-cgi/trace",
+		VerifyV4URLs:        []string{"https://checkip.amazonaws.com/", "https://api.ipify.org/?format=json", "https://ipapi.co/json/"},
+		VerifyV6URLs:        []string{"https://api6.ipify.org/?format=json", "https://api64.ipify.org/?format=json", "https://ipapi.co/json/"},
+		FallbackEchoURL:     "https://api64.ipify.org/?format=json",
+		FallbackLocationURL: "https://ipapi.co/json/",
 	}
 }
 
 func (p *poolOutbound) lookupExit(member *memberState) (ipmeta.Location, error) {
-	transport := &http.Transport{DialContext: func(ctx context.Context, _, address string) (net.Conn, error) {
-		return member.outbound.DialContext(ctx, N.NetworkTCP, M.ParseSocksaddr(address))
-	}, DisableKeepAlives: true, TLSHandshakeTimeout: 5 * time.Second}
+	ctx, cancel := context.WithTimeout(p.ctx, 15*time.Second)
+	defer cancel()
+	transport := &http.Transport{DialContext: func(dialCtx context.Context, _, address string) (net.Conn, error) {
+		return member.outbound.DialContext(dialCtx, N.NetworkTCP, M.ParseSocksaddr(address))
+	}, DisableKeepAlives: true, TLSHandshakeTimeout: 4 * time.Second}
 	defer transport.CloseIdleConnections()
-	client := &http.Client{Transport: transport, Timeout: 5 * time.Second, CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}
+	client := &http.Client{Transport: transport, Timeout: 4 * time.Second, CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}
 	var metadata *ipmeta.Service
 	if p.monitor != nil {
 		metadata = p.monitor.Metadata
 	}
-	return lookupExitFrom(p.ctx, client, "https://api64.ipify.org/?format=json", "https://ipapi.co/json/", metadata)
+	return lookupExitWithConfig(ctx, client, defaultExitProbeConfig(), metadata)
+}
+
+func lookupExitWithConfig(ctx context.Context, client *http.Client, cfg exitProbeConfig, metadata *ipmeta.Service) (ipmeta.Location, error) {
+	var (
+		cfLoc ipmeta.Location
+		cfIP  netip.Addr
+		hasCF bool
+	)
+	for _, endpoint := range []string{cfg.CFTraceV4URL, cfg.CFTraceV6URL, cfg.CFTraceDualURL} {
+		if strings.TrimSpace(endpoint) == "" {
+			continue
+		}
+		if ctx.Err() != nil {
+			return ipmeta.Location{}, ctx.Err()
+		}
+		loc, ip, err := lookupCloudflareTrace(ctx, client, endpoint)
+		if err == nil {
+			cfLoc, cfIP, hasCF = loc, ip, true
+			break
+		}
+	}
+
+	if !hasCF {
+		if ctx.Err() != nil {
+			return ipmeta.Location{}, ctx.Err()
+		}
+		if cfg.FallbackEchoURL != "" && cfg.FallbackLocationURL != "" {
+			return lookupExitFrom(ctx, client, cfg.FallbackEchoURL, cfg.FallbackLocationURL, metadata)
+		}
+		return ipmeta.Location{}, errors.New("cloudflare exit probe unavailable")
+	}
+
+	var (
+		lastErr      error
+		sawRateLimit bool
+		verified     bool
+	)
+
+	if metadata != nil && metadata.HasInfo() {
+		if preferred, err := metadata.Self(ctx, client); err == nil {
+			if obs, parseErr := netip.ParseAddr(preferred.IP); parseErr == nil {
+				obs = obs.Unmap()
+				// On dual-stack proxies, IPinfo may use the opposite IP family; only compare same-family pairs.
+				if obs.Is4() == cfIP.Is4() {
+					if obs != cfIP {
+						return ipmeta.Location{}, fmt.Errorf("%w: cloudflare saw %s, ipinfo saw %s", errExitProbeMismatch, cfIP, obs)
+					}
+					iso := geoip.NormalizeCountryCode(preferred.ISO)
+					if iso == geoip.UnknownCountryCode {
+						iso = cfLoc.ISO
+					}
+					cfLoc = preferred
+					cfLoc.IP = cfIP.String()
+					cfLoc.ISO = iso
+					verified = true
+				}
+			}
+		}
+	}
+
+	if !verified {
+		verifiers := cfg.VerifyV4URLs
+		if !cfIP.Is4() {
+			verifiers = cfg.VerifyV6URLs
+		}
+		for _, endpoint := range verifiers {
+			if strings.TrimSpace(endpoint) == "" {
+				continue
+			}
+			if ctx.Err() != nil {
+				return ipmeta.Location{}, ctx.Err()
+			}
+			obsLoc, obsIP, err := readObservedExit(ctx, client, endpoint)
+			if err != nil {
+				lastErr = err
+				if errors.Is(err, errExitProbeRateLimited) {
+					sawRateLimit = true
+				}
+				continue
+			}
+			if obsIP.Is4() != cfIP.Is4() {
+				continue
+			}
+			if obsIP != cfIP {
+				return ipmeta.Location{}, fmt.Errorf("%w: cloudflare saw %s, verifier saw %s", errExitProbeMismatch, cfIP, obsIP)
+			}
+			if cfLoc.Country == "" && obsLoc.Country != "" {
+				cfLoc.Country = obsLoc.Country
+			}
+			if cfLoc.Org == "" && obsLoc.Org != "" {
+				cfLoc.Org = obsLoc.Org
+			}
+			if cfLoc.ISO == "" || cfLoc.ISO == geoip.UnknownCountryCode {
+				if iso := geoip.NormalizeCountryCode(obsLoc.ISO); iso != geoip.UnknownCountryCode {
+					cfLoc.ISO = iso
+				}
+			}
+			verified = true
+			break
+		}
+	}
+
+	if !verified {
+		if ctx.Err() != nil {
+			return ipmeta.Location{}, ctx.Err()
+		}
+		if sawRateLimit {
+			return ipmeta.Location{}, fmt.Errorf("exit verification failed: %w", errExitProbeRateLimited)
+		}
+		if lastErr != nil {
+			return ipmeta.Location{}, fmt.Errorf("exit verification failed: %w", lastErr)
+		}
+		return ipmeta.Location{}, errors.New("exit verification failed: no same-family confirmation")
+	}
+
+	cfLoc.IP = cfIP.String()
+	cfLoc.ISO = geoip.NormalizeCountryCode(cfLoc.ISO)
+	return cfLoc, nil
+}
+
+func lookupCloudflareTrace(ctx context.Context, client *http.Client, endpoint string) (ipmeta.Location, netip.Addr, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
+	if err != nil {
+		return ipmeta.Location{}, netip.Addr{}, err
+	}
+	resp, err := client.Do(req)
+	if err != nil {
+		return ipmeta.Location{}, netip.Addr{}, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode == http.StatusTooManyRequests {
+		return ipmeta.Location{}, netip.Addr{}, fmt.Errorf("%w: HTTP 429", errExitProbeRateLimited)
+	}
+	if resp.StatusCode != http.StatusOK {
+		return ipmeta.Location{}, netip.Addr{}, fmt.Errorf("unexpected HTTP status %d", resp.StatusCode)
+	}
+	body, err := io.ReadAll(io.LimitReader(resp.Body, 4096))
+	if err != nil {
+		return ipmeta.Location{}, netip.Addr{}, err
+	}
+	var rawIP, rawLoc string
+	for _, line := range strings.Split(string(body), "\n") {
+		k, v, ok := strings.Cut(strings.TrimSpace(line), "=")
+		if !ok {
+			continue
+		}
+		switch k {
+		case "ip":
+			rawIP = strings.TrimSpace(v)
+		case "loc":
+			rawLoc = strings.TrimSpace(v)
+		}
+	}
+	ip, err := netip.ParseAddr(rawIP)
+	if err != nil || !ip.IsGlobalUnicast() || ip.IsPrivate() {
+		return ipmeta.Location{}, netip.Addr{}, fmt.Errorf("invalid cloudflare trace IP")
+	}
+	ip = ip.Unmap()
+	return ipmeta.Location{
+		IP:  ip.String(),
+		ISO: geoip.NormalizeCountryCode(rawLoc),
+	}, ip, nil
+}
+
+func readObservedExit(ctx context.Context, client *http.Client, endpoint string) (ipmeta.Location, netip.Addr, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
+	if err != nil {
+		return ipmeta.Location{}, netip.Addr{}, err
+	}
+	resp, err := client.Do(req)
+	if err != nil {
+		return ipmeta.Location{}, netip.Addr{}, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode == http.StatusTooManyRequests {
+		return ipmeta.Location{}, netip.Addr{}, fmt.Errorf("%w: HTTP 429", errExitProbeRateLimited)
+	}
+	if resp.StatusCode != http.StatusOK {
+		return ipmeta.Location{}, netip.Addr{}, fmt.Errorf("unexpected HTTP status %d", resp.StatusCode)
+	}
+	body, err := io.ReadAll(io.LimitReader(resp.Body, 4096))
+	if err != nil {
+		return ipmeta.Location{}, netip.Addr{}, err
+	}
+	trimmed := strings.TrimSpace(string(body))
+	if trimmed == "" {
+		return ipmeta.Location{}, netip.Addr{}, errors.New("empty exit probe response")
+	}
+	if strings.HasPrefix(trimmed, "{") {
+		var result struct {
+			IP      string `json:"ip"`
+			ISO     string `json:"country_code"`
+			Country string `json:"country_name"`
+			Org     string `json:"org"`
+			Error   any    `json:"error"`
+			Reason  string `json:"reason"`
+		}
+		if err := json.Unmarshal([]byte(trimmed), &result); err != nil {
+			return ipmeta.Location{}, netip.Addr{}, err
+		}
+		if result.Error != nil && result.Error != false || result.IP == "" {
+			errMsg := strings.ToLower(fmt.Sprint(result.Error) + " " + result.Reason)
+			if strings.Contains(errMsg, "ratelimit") || strings.Contains(errMsg, "too many requests") {
+				return ipmeta.Location{}, netip.Addr{}, fmt.Errorf("%w: %s", errExitProbeRateLimited, strings.TrimSpace(errMsg))
+			}
+			return ipmeta.Location{}, netip.Addr{}, errors.New("invalid JSON exit response")
+		}
+		ip, err := netip.ParseAddr(result.IP)
+		if err != nil || !ip.IsGlobalUnicast() || ip.IsPrivate() {
+			return ipmeta.Location{}, netip.Addr{}, errors.New("invalid JSON exit address")
+		}
+		ip = ip.Unmap()
+		return ipmeta.Location{
+			IP:      ip.String(),
+			ISO:     geoip.NormalizeCountryCode(result.ISO),
+			Country: strings.TrimSpace(result.Country),
+			Org:     strings.TrimSpace(result.Org),
+		}, ip, nil
+	}
+	ip, err := netip.ParseAddr(trimmed)
+	if err != nil || !ip.IsGlobalUnicast() || ip.IsPrivate() {
+		return ipmeta.Location{}, netip.Addr{}, errors.New("invalid plain-text exit address")
+	}
+	ip = ip.Unmap()
+	return ipmeta.Location{IP: ip.String()}, ip, nil
 }
 
 // Require independent agreement before classifying a node: a proxy can use

@@ -53,6 +53,8 @@ func (a Abuse) NetworkType() string {
 	return "unknown"
 }
 
+const maxCacheEntries = 10000
+
 // Service survives runtime reloads. Each provider has a serialized request
 // lane and its own keep-alive transport, cache and key cooldowns.
 type Service struct {
@@ -213,6 +215,14 @@ func (s *Service) Lookup(ctx context.Context, ip string) (Location, error) {
 	}
 	result.ISO = strings.ToUpper(result.ISO)
 	s.mu.Lock()
+	if len(s.locations) >= maxCacheEntries {
+		for k := range s.locations {
+			delete(s.locations, k)
+			if len(s.locations) < maxCacheEntries {
+				break
+			}
+		}
+	}
 	s.locations[ip] = result
 	s.mu.Unlock()
 	return result, nil
@@ -252,13 +262,21 @@ func (s *Service) Check(ctx context.Context, ip string) (Abuse, error) {
 		check = abuseCheck{retryAfter: now.Add(time.Hour)}
 	}
 	s.mu.Lock()
-	if now.Sub(s.lastAbusePrune) >= time.Hour {
+	if now.Sub(s.lastAbusePrune) >= time.Hour || len(s.checks) >= maxCacheEntries {
 		for address, cached := range s.checks {
 			if !now.Before(cached.retryAfter) {
 				delete(s.checks, address)
 			}
 		}
 		s.lastAbusePrune = now
+	}
+	if len(s.checks) >= maxCacheEntries {
+		for address := range s.checks {
+			delete(s.checks, address)
+			if len(s.checks) < maxCacheEntries {
+				break
+			}
+		}
 	}
 	s.checks[ip] = check
 	s.mu.Unlock()

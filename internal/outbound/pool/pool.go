@@ -71,6 +71,9 @@ type Options struct {
 	// Unnamed requests retain the pool's normal scheduling behaviour.
 	SessionRouting bool
 	Region         string // Non-empty: only nodes whose measured exit is in this region.
+	// SecondaryView marks auxiliary pool instances (GeoIP/sticky/hybrid views)
+	// that share monitor entries registered by the primary pool without re-registering.
+	SecondaryView bool
 }
 
 // MemberMeta carries optional descriptive information for monitoring UI.
@@ -109,7 +112,8 @@ type poolOutbound struct {
 	mode           string
 	members        []*memberState
 	membersByID    map[string][]*memberState
-	mu             sync.Mutex
+	membersByTag   map[string]*memberState
+	mu             sync.RWMutex
 	rrCounter      atomic.Uint32
 	rng            *rand.Rand
 	rngMu          sync.Mutex // protects rng for random mode
@@ -119,6 +123,8 @@ type poolOutbound struct {
 	stickyMu       sync.Mutex        // protects stickyMap
 	stickyMap      map[string]string // sticky key (client source IP) -> member tag
 	sessionStore   *routing.Store
+	exitLookupCh   chan exitLookupTask
+	exitLookupOnce sync.Once
 }
 
 func newPool(ctx context.Context, _ adapter.Router, logger singlog.ContextLogger, tag string, options Options) (adapter.Outbound, error) {
@@ -160,15 +166,15 @@ func newPool(ctx context.Context, _ adapter.Router, logger singlog.ContextLogger
 		}
 	}
 
-	// Register nodes immediately if monitor is available
-	if monitorMgr != nil {
+	// Register nodes immediately if monitor is available (primary pool only)
+	if monitorMgr != nil && !normalized.SecondaryView {
 		if memberCount > 1 {
 			logger.Info("registering ", memberCount, " nodes to monitor")
 		}
 		registeredCount := 0
 		for _, memberTag := range normalized.Members {
-			// Acquire shared state for this tag (creates if not exists)
-			state := acquireSharedState(memberTag)
+			// Acquire shared state for this node identity (creates if not exists)
+			state := acquireSharedState(p.sharedStateKey(memberTag))
 
 			meta := normalized.Metadata[memberTag]
 			info := monitor.NodeInfo{
@@ -189,8 +195,8 @@ func newPool(ctx context.Context, _ adapter.Router, logger singlog.ContextLogger
 				state.attachEntry(entry)
 				registeredCount++
 				// Set probe, release, and blacklist functions immediately
-				entry.SetRelease(p.makeReleaseByTagFunc(memberTag))
-				entry.SetBlacklistFn(p.makeBlacklistByTagFunc(memberTag))
+				entry.SetRelease(state.forceRelease)
+				entry.SetBlacklistFn(state.manualBlacklist)
 				if probeFn := p.makeProbeByTagFunc(memberTag); probeFn != nil {
 					entry.SetProbe(probeFn)
 				} else {
@@ -205,7 +211,7 @@ func newPool(ctx context.Context, _ adapter.Router, logger singlog.ContextLogger
 		if memberCount > 1 {
 			logger.Info("registered ", registeredCount, " nodes to monitor")
 		}
-	} else {
+	} else if monitorMgr == nil && !normalized.SecondaryView {
 		logger.Warn("monitor manager is nil, skipping node registration")
 	}
 
@@ -213,6 +219,13 @@ func newPool(ctx context.Context, _ adapter.Router, logger singlog.ContextLogger
 	registerDialer(tag, p)
 
 	return p, nil
+}
+
+func (p *poolOutbound) sharedStateKey(tag string) string {
+	if id := p.options.Metadata[tag].Identity; id != "" {
+		return id
+	}
+	return tag
 }
 
 func normalizeOptions(options Options) Options {
@@ -279,7 +292,7 @@ func (p *poolOutbound) initializeMembersLocked() error {
 		}
 
 		// Acquire shared state (creates if not exists, reuses if already created)
-		state := acquireSharedState(tag)
+		state := acquireSharedState(p.sharedStateKey(tag))
 
 		member := &memberState{
 			outbound: detour,
@@ -288,27 +301,33 @@ func (p *poolOutbound) initializeMembersLocked() error {
 			entry:    state.entryHandle(),
 		}
 
-		// Connect to existing monitor entry if available
-		if p.monitor != nil {
-			meta := p.options.Metadata[tag]
-			info := monitor.NodeInfo{
-				Tag:           tag,
-				Name:          meta.Name,
-				URI:           meta.URI,
-				Mode:          meta.Mode,
-				ListenAddress: meta.ListenAddress,
-				Port:          meta.Port,
-				Region:        meta.Region,
-				Country:       meta.Country,
-				EntryCountry:  meta.EntryCountry,
-				EntryISO:      meta.EntryISO,
+		// Primary pool binds probe/release/blacklist callbacks; secondary views
+		// reuse the shared state and monitor entry registered by the primary pool.
+		if p.monitor != nil && !p.options.SecondaryView {
+			entry := member.entry
+			if entry == nil {
+				meta := p.options.Metadata[tag]
+				info := monitor.NodeInfo{
+					Tag:           tag,
+					Name:          meta.Name,
+					URI:           meta.URI,
+					Mode:          meta.Mode,
+					ListenAddress: meta.ListenAddress,
+					Port:          meta.Port,
+					Region:        meta.Region,
+					Country:       meta.Country,
+					EntryCountry:  meta.EntryCountry,
+					EntryISO:      meta.EntryISO,
+				}
+				entry = p.monitor.Register(info)
+				if entry != nil {
+					state.attachEntry(entry)
+					member.entry = entry
+				}
 			}
-			entry := p.monitor.Register(info)
 			if entry != nil {
-				state.attachEntry(entry)
-				member.entry = entry
 				entry.SetRelease(p.makeReleaseFunc(member))
-				entry.SetBlacklistFn(p.makeBlacklistByTagFunc(member.tag))
+				entry.SetBlacklistFn(state.manualBlacklist)
 				p.setMemberProbe(member)
 			}
 		}
@@ -316,7 +335,9 @@ func (p *poolOutbound) initializeMembersLocked() error {
 	}
 	p.members = members
 	p.indexMembersLocked()
-	p.logger.Info("pool initialized with ", len(members), " members")
+	if !p.options.SecondaryView {
+		p.logger.Info("pool initialized with ", len(members), " members")
+	}
 
 	return nil
 }
@@ -620,32 +641,45 @@ func (p *poolOutbound) pickFastest(network string, tried map[string]bool, fastes
 func (p *poolOutbound) pickMemberFor(network string, tried map[string]bool, stickyKey, nodeID string, fastest routing.FastestRoute) (*memberState, error) {
 	now := time.Now()
 
-	p.mu.Lock()
+	p.mu.RLock()
 	if len(p.members) == 0 {
-		if err := p.initializeMembersLocked(); err != nil {
-			p.mu.Unlock()
-			return nil, err
+		p.mu.RUnlock()
+		p.mu.Lock()
+		if len(p.members) == 0 {
+			if err := p.initializeMembersLocked(); err != nil {
+				p.mu.Unlock()
+				return nil, err
+			}
 		}
+		p.mu.Unlock()
+		p.mu.RLock()
 	}
 	// Most named-session traffic already has a successful pin. Resolve it in
 	// O(1) rather than scanning and locking every node in a large pool.
 	if nodeID != "" {
 		if p.membersByID == nil {
-			p.indexMembersLocked()
+			p.mu.RUnlock()
+			p.mu.Lock()
+			if p.membersByID == nil {
+				p.indexMembersLocked()
+			}
+			p.mu.Unlock()
+			p.mu.RLock()
 		}
+		nowNano := now.UnixNano()
 		for _, member := range p.membersByID[nodeID] {
 			if !tried[member.tag] && (network == "" || common.Contains(member.outbound.Network(), network)) &&
-				(member.entry == nil || member.entry.Available()) &&
-				(p.options.Region == "" || member.entry.ExitRegion() == p.options.Region) &&
-				(member.shared == nil || !member.shared.isBlacklisted(now)) {
-				p.mu.Unlock()
+				(member.entry == nil || member.entry.AvailableFast(nowNano)) &&
+				(p.options.Region == "" || (member.entry != nil && member.entry.ExitRegion() == p.options.Region)) &&
+				(member.shared == nil || !member.shared.isBlacklistedFast(now)) {
+				p.mu.RUnlock()
 				return member, nil
 			}
 		}
 	}
 	candidates := p.getCandidateBuffer()
 	candidates = p.availableMembersLocked(now, network, candidates)
-	p.mu.Unlock()
+	p.mu.RUnlock()
 
 	if len(candidates) == 0 {
 		p.mu.Lock()
@@ -725,16 +759,22 @@ func (p *poolOutbound) pickMember(network string) (*memberState, error) {
 	now := time.Now()
 	candidates := p.getCandidateBuffer()
 
-	p.mu.Lock()
+	p.mu.RLock()
 	if len(p.members) == 0 {
-		if err := p.initializeMembersLocked(); err != nil {
-			p.mu.Unlock()
-			p.putCandidateBuffer(candidates)
-			return nil, err
+		p.mu.RUnlock()
+		p.mu.Lock()
+		if len(p.members) == 0 {
+			if err := p.initializeMembersLocked(); err != nil {
+				p.mu.Unlock()
+				p.putCandidateBuffer(candidates)
+				return nil, err
+			}
 		}
+		p.mu.Unlock()
+		p.mu.RLock()
 	}
 	candidates = p.availableMembersLocked(now, network, candidates)
-	p.mu.Unlock()
+	p.mu.RUnlock()
 
 	if len(candidates) == 0 {
 		p.mu.Lock()
@@ -756,20 +796,16 @@ func (p *poolOutbound) pickMember(network string) (*memberState, error) {
 
 func (p *poolOutbound) availableMembersLocked(now time.Time, network string, buf []*memberState) []*memberState {
 	result := buf[:0]
+	nowNano := now.UnixNano()
 	for _, member := range p.members {
-		// Check blacklist via shared state (auto-clears if expired)
-		if member.shared != nil && member.shared.isBlacklisted(now) {
-			// Log blacklisted nodes for debugging
-			remaining := member.shared.blacklistRemaining(now)
-			if remaining > 0 {
-				p.logger.Debug("skipping blacklisted node: ", member.tag, ", remaining: ", remaining.Round(time.Second))
-			}
+		// Check blacklist via lock-free fast path (auto-clears on expiry when needed)
+		if member.shared != nil && member.shared.isBlacklistedFast(now) {
 			continue
 		}
 		if network != "" && !common.Contains(member.outbound.Network(), network) {
 			continue
 		}
-		if member.entry != nil && !member.entry.Available() {
+		if member.entry != nil && !member.entry.AvailableFast(nowNano) {
 			continue
 		}
 		if p.options.Region != "" && member.entry.ExitRegion() != p.options.Region {
@@ -991,24 +1027,24 @@ func (p *poolOutbound) recordFailure(member *memberState, cause error) {
 		// Upstream quota exhausted (429): park the node for the rate-limit
 		// cooldown, which is typically far longer than a network blip.
 		cooldown := policy.cooldownFor(faultRateLimit)
-		p.logger.Warn("proxy ", member.tag, " rate-limited (429), cooling down for ", cooldown, " until ", until.Format("15:04:05"), ": ", cause)
+		p.logger.Debug("proxy ", member.tag, " rate-limited (429), cooling down for ", cooldown, " until ", until.Format("15:04:05"), ": ", cause)
 		log.Printf("[pool] %s rate-limited (429), cooldown %s until %s: %v", member.tag, cooldown, until.Format("15:04:05"), cause)
 	case kind == faultTransient:
 		// Transient (timeout / reset / 503): short cooldown, not counted toward
 		// the blacklist. The node is retried automatically once it ends.
 		cooldown := policy.cooldownFor(faultTransient)
-		p.logger.Warn("proxy ", member.tag, " transient failure, cooling down for ", cooldown, " until ", until.Format("15:04:05"), ": ", cause)
+		p.logger.Debug("proxy ", member.tag, " transient failure, cooling down for ", cooldown, " until ", until.Format("15:04:05"), ": ", cause)
 		log.Printf("[pool] %s transient failure, cooldown %s until %s: %v", member.tag, cooldown, until.Format("15:04:05"), cause)
 	case blacklisted:
 		// Report the real remaining span, not the configured duration: an
 		// already-running longer ban wins over a fresh one, so `until` can be
 		// further out than BlacklistDuration.
 		remaining := time.Until(until).Round(time.Second)
-		p.logger.Warn("proxy ", member.tag, " blacklisted for ", remaining, ": ", cause)
+		p.logger.Debug("proxy ", member.tag, " blacklisted for ", remaining, ": ", cause)
 		log.Printf("⚠️  [pool] %s BLACKLISTED for %s (until %s): %v", member.tag, remaining, until.Format("15:04:05"), cause)
 		log.Printf("    To release immediately, use WebUI or: POST /api/nodes/%s/release", member.tag)
 	default:
-		p.logger.Warn("proxy ", member.tag, " failure ", failures, "/", p.options.FailureThreshold, ": ", cause)
+		p.logger.Debug("proxy ", member.tag, " failure ", failures, "/", p.options.FailureThreshold, ": ", cause)
 		log.Printf("[pool] %s failure %d/%d: %v", member.tag, failures, p.options.FailureThreshold, cause)
 	}
 }
@@ -1085,17 +1121,30 @@ const maxProbeHeaderBytes = 64 * 1024
 var exitLookupGate = make(chan struct{}, 16)
 var exitLookupErrors atomic.Int64
 
-// httpProbe validates an HTTP response without reading its body. A socket that
-// emits one byte, a proxy authentication failure, or a quota/error response is
-// not a successful health check. Header size and deadlines bound the parser.
+// httpProbe validates an HTTP response without reading its body.
 func httpProbe(conn net.Conn, host string) (time.Duration, error) {
+	return httpProbeContext(context.Background(), conn, host)
+}
+
+func httpProbeContext(ctx context.Context, conn net.Conn, host string) (time.Duration, error) {
 	req := fmt.Sprintf("GET /generate_204 HTTP/1.1\r\nHost: %s\r\nConnection: close\r\nUser-Agent: easy-proxies-health\r\n\r\n", host)
-	_ = conn.SetWriteDeadline(time.Now().Add(5 * time.Second))
+	now := time.Now()
+	writeDeadline := now.Add(5 * time.Second)
+	readDeadline := now.Add(10 * time.Second)
+	if ctxDeadline, ok := ctx.Deadline(); ok {
+		if ctxDeadline.Before(writeDeadline) {
+			writeDeadline = ctxDeadline
+		}
+		if ctxDeadline.Before(readDeadline) {
+			readDeadline = ctxDeadline
+		}
+	}
+	_ = conn.SetWriteDeadline(writeDeadline)
 	start := time.Now()
 	if _, err := io.WriteString(conn, req); err != nil {
 		return 0, fmt.Errorf("write request: %w", err)
 	}
-	_ = conn.SetReadDeadline(time.Now().Add(10 * time.Second))
+	_ = conn.SetReadDeadline(readDeadline)
 	response, err := http.ReadResponse(bufio.NewReader(io.LimitReader(conn, maxProbeHeaderBytes)), &http.Request{Method: http.MethodGet})
 	if err != nil {
 		return 0, fmt.Errorf("read HTTP response: %w", err)
@@ -1108,6 +1157,20 @@ func httpProbe(conn net.Conn, host string) (time.Duration, error) {
 	return time.Since(start), nil
 }
 
+func isProbeTimeoutError(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, context.DeadlineExceeded) {
+		return true
+	}
+	var netErr net.Error
+	if errors.As(err, &netErr) && netErr.Timeout() {
+		return true
+	}
+	return classifyFailure(err) != faultPermanent
+}
+
 // probeMember dials the probe destination through a member and measures latency.
 // A context watchdog force-closes the underlying connection when ctx is cancelled
 // or its deadline fires. This is essential: some sing-box outbound connection
@@ -1116,24 +1179,37 @@ func httpProbe(conn net.Conn, host string) (time.Duration, error) {
 // handshake forever, leaking goroutines and hanging the whole batch probe
 // (wg.Wait would never return, freezing the WebUI at "N/M").
 func (p *poolOutbound) probeMember(ctx context.Context, member *memberState, destination M.Socksaddr, host string, useTLS, skipCertVerify bool) (time.Duration, error) {
-	probeFailure := func(err error) {
+	recordNonTLSError := func(err error) {
 		if errors.Is(ctx.Err(), context.Canceled) {
 			return
 		}
-		if useTLS && member.shared != nil {
-			if member.entry != nil {
-				member.entry.MarkAvailable(false)
-			}
-			until := member.shared.blacklistNow(err, p.failurePolicy(), true)
-			log.Printf("[pool] %s failed HTTPS health check; blacklisted until %s: %v", member.tag, until.Format(time.RFC3339), err)
+		if member.entry != nil {
+			member.entry.MarkAvailable(false)
+		}
+		if member.shared != nil {
+			p.recordFailure(member, err)
 		} else if member.entry != nil {
 			member.entry.RecordFailure(err)
 		}
 	}
+	recordTLSFailure := func(err error, strictHTTPS bool) {
+		if errors.Is(ctx.Err(), context.Canceled) {
+			return
+		}
+		if useTLS && member.shared != nil && !isProbeTimeoutError(err) {
+			if member.entry != nil {
+				member.entry.MarkAvailable(false)
+			}
+			until := member.shared.blacklistNow(err, p.failurePolicy(), strictHTTPS)
+			log.Printf("[pool] %s failed HTTPS health check (strict=%v); blacklisted until %s: %v", member.tag, strictHTTPS, until.Format(time.RFC3339), err)
+			return
+		}
+		recordNonTLSError(err)
+	}
 	start := time.Now()
 	rawConn, err := member.outbound.DialContext(ctx, N.NetworkTCP, destination)
 	if err != nil {
-		probeFailure(err)
+		recordNonTLSError(err)
 		return 0, err
 	}
 	// Watchdog: close the raw connection as soon as ctx is done so any blocked
@@ -1153,13 +1229,18 @@ func (p *poolOutbound) probeMember(ctx context.Context, member *memberState, des
 	// HTTPS probes always negotiate TLS; certificate validation follows the
 	// configured skip-cert policy (strict by default).
 	if conn, err = upgradeProbeConn(ctx, conn, host, useTLS, skipCertVerify); err != nil {
-		probeFailure(err)
+		recordTLSFailure(err, true)
 		return 0, err
 	}
 
 	// Perform HTTP probe to measure actual latency (TTFB).
-	if _, err = httpProbe(conn, destination.AddrString()); err != nil {
-		probeFailure(err)
+	if _, err = httpProbeContext(ctx, conn, destination.AddrString()); err != nil {
+		isHTTPStatus := strings.Contains(err.Error(), "HTTP probe returned status")
+		if isHTTPStatus {
+			recordTLSFailure(err, false)
+		} else {
+			recordNonTLSError(err)
+		}
 		return 0, err
 	}
 
@@ -1208,42 +1289,38 @@ func (p *poolOutbound) makeProbeByTagFunc(tag string) func(ctx context.Context) 
 	}
 	return func(ctx context.Context) (time.Duration, error) {
 		// Ensure members are initialized
-		p.mu.Lock()
+		p.mu.RLock()
 		if len(p.members) == 0 {
-			if err := p.initializeMembersLocked(); err != nil {
-				p.mu.Unlock()
-				return 0, err
+			p.mu.RUnlock()
+			p.mu.Lock()
+			if len(p.members) == 0 {
+				if err := p.initializeMembersLocked(); err != nil {
+					p.mu.Unlock()
+					return 0, err
+				}
 			}
+			p.mu.Unlock()
+			p.mu.RLock()
 		}
 
-		// Find the member by tag
-		var member *memberState
-		for _, m := range p.members {
-			if m.tag == tag {
-				member = m
-				break
+		if p.membersByTag == nil && len(p.members) > 0 {
+			p.mu.RUnlock()
+			p.mu.Lock()
+			if p.membersByTag == nil {
+				p.indexMembersLocked()
 			}
+			p.mu.Unlock()
+			p.mu.RLock()
 		}
-		p.mu.Unlock()
+
+		// Find the member by tag in O(1)
+		member := p.membersByTag[tag]
+		p.mu.RUnlock()
 
 		if member == nil {
 			return 0, E.New("member not found: ", tag)
 		}
 		return p.probeMember(ctx, member, destination, host, useTLS, skipCertVerify)
-	}
-}
-
-// makeReleaseByTagFunc creates a release function that works before member initialization
-func (p *poolOutbound) makeReleaseByTagFunc(tag string) func() {
-	return func() {
-		releaseSharedMember(tag)
-	}
-}
-
-// makeBlacklistByTagFunc creates a blacklist function for manual ban via API
-func (p *poolOutbound) makeBlacklistByTagFunc(tag string) func(time.Duration) {
-	return func(duration time.Duration) {
-		blacklistSharedMember(tag, duration)
 	}
 }
 
@@ -1290,12 +1367,13 @@ func (p *poolOutbound) getCandidateBuffer() []*memberState {
 	return make([]*memberState, 0, len(p.options.Members))
 }
 
+const maxCandidateBufferCap = 65536
+
 func (p *poolOutbound) putCandidateBuffer(buf []*memberState) {
 	if buf == nil {
 		return
 	}
-	const maxCached = 4096
-	if cap(buf) > maxCached {
+	if cap(buf) > maxCandidateBufferCap {
 		return
 	}
 	p.candidatesPool.Put(buf[:0])
@@ -1305,9 +1383,11 @@ func (p *poolOutbound) putCandidateBuffer(buf []*memberState) {
 // Duplicate subscription entries retain their original candidate order.
 func (p *poolOutbound) indexMembersLocked() {
 	p.membersByID = make(map[string][]*memberState, len(p.members))
+	p.membersByTag = make(map[string]*memberState, len(p.members))
 	for _, member := range p.members {
 		id := p.memberIdentity(member)
 		p.membersByID[id] = append(p.membersByID[id], member)
+		p.membersByTag[member.tag] = member
 	}
 }
 

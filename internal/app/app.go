@@ -7,13 +7,33 @@ import (
 	"os"
 	"os/signal"
 	"syscall"
-	"time"
 
 	"easy_proxies/internal/boxmgr"
 	"easy_proxies/internal/config"
 	"easy_proxies/internal/monitor"
 	"easy_proxies/internal/subscription"
 )
+
+func buildMonitorConfig(cfg *config.Config) monitor.Config {
+	proxyUsername := cfg.Listener.Username
+	proxyPassword := cfg.Listener.Password
+	if cfg.Mode == "multi-port" || cfg.Mode == "hybrid" {
+		proxyUsername = cfg.MultiPort.Username
+		proxyPassword = cfg.MultiPort.Password
+	}
+
+	return monitor.Config{
+		Enabled:          cfg.ManagementEnabled(),
+		Listen:           cfg.Management.Listen,
+		ProbeTarget:      cfg.Management.ProbeTarget,
+		SkipCertVerify:   cfg.SkipCertVerify,
+		Password:         cfg.Management.Password,
+		ProxyUsername:    proxyUsername,
+		ProxyPassword:    proxyPassword,
+		ExternalIP:       cfg.ExternalIP,
+		ProbeConcurrency: cfg.ProbeConcurrencyOrDefault(),
+	}
+}
 
 // Run builds the runtime components from config and blocks until shutdown.
 func Run(ctx context.Context, cfg *config.Config) error {
@@ -23,24 +43,7 @@ func Run(ctx context.Context, cfg *config.Config) error {
 	if ctx == nil {
 		ctx = context.Background()
 	}
-	// Build monitor config
-	proxyUsername := cfg.Listener.Username
-	proxyPassword := cfg.Listener.Password
-	if cfg.Mode == "multi-port" || cfg.Mode == "hybrid" {
-		proxyUsername = cfg.MultiPort.Username
-		proxyPassword = cfg.MultiPort.Password
-	}
-
-	monitorCfg := monitor.Config{
-		Enabled:          cfg.ManagementEnabled(),
-		Listen:           cfg.Management.Listen,
-		ProbeTarget:      cfg.Management.ProbeTarget,
-		Password:         cfg.Management.Password,
-		ProxyUsername:    proxyUsername,
-		ProxyPassword:    proxyPassword,
-		ExternalIP:       cfg.ExternalIP,
-		ProbeConcurrency: cfg.ProbeConcurrencyOrDefault(),
-	}
+	monitorCfg := buildMonitorConfig(cfg)
 
 	// Create and start BoxManager
 	boxMgr := boxmgr.New(cfg, monitorCfg)
@@ -80,10 +83,6 @@ func Run(ctx context.Context, cfg *config.Config) error {
 		fmt.Printf("Received %s, initiating graceful shutdown...\n", sig)
 	}
 
-	// Create shutdown context with timeout
-	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 30*time.Second)
-	defer shutdownCancel()
-
 	// Graceful shutdown sequence
 	fmt.Println("Stopping subscription manager...")
 	if subMgr != nil {
@@ -95,14 +94,6 @@ func Run(ctx context.Context, cfg *config.Config) error {
 		fmt.Printf("Error closing box manager: %v\n", err)
 	}
 
-	// Wait for connections to drain
-	fmt.Println("Waiting for connections to drain...")
-	select {
-	case <-time.After(2 * time.Second):
-		fmt.Println("Graceful shutdown completed")
-	case <-shutdownCtx.Done():
-		fmt.Println("Shutdown timeout exceeded, forcing exit")
-	}
-
+	fmt.Println("Graceful shutdown completed")
 	return nil
 }

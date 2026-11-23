@@ -2,6 +2,7 @@ package boxmgr
 
 import (
 	"context"
+	"crypto/sha256"
 	"errors"
 	"fmt"
 	"log"
@@ -17,6 +18,7 @@ import (
 	"easy_proxies/internal/inbound/session"
 	"easy_proxies/internal/monitor"
 	"easy_proxies/internal/outbound/pool"
+	"easy_proxies/internal/prescreen"
 	"easy_proxies/internal/routing"
 
 	"github.com/sagernet/sing-box"
@@ -35,9 +37,9 @@ const (
 	periodicHealthInterval    = 5 * time.Minute
 	// periodicHealthTimeout bounds each individual probe. Unreachable nodes wait
 	// out this full deadline, so at scale (thousands of nodes) it dominates the
-	// total sweep time; 8s comfortably covers a healthy node's dial+TLS+HTTP
-	// while letting dead nodes be abandoned sooner.
-	periodicHealthTimeout = 8 * time.Second
+	// total sweep time; 5s covers a healthy node's dial+TLS+HTTP while letting
+	// dead nodes be abandoned sooner.
+	periodicHealthTimeout = 5 * time.Second
 )
 
 // Logger defines logging interface for the manager.
@@ -148,9 +150,67 @@ func (m *Manager) Start(ctx context.Context) (err error) {
 		return err
 	}
 
+	if cfg.SubscriptionRefresh.PreScreenEnabledFor(len(cfg.Nodes)) {
+		inlineOrRetained := make([]config.NodeConfig, 0, len(cfg.Nodes))
+		subOrFile := make([]config.NodeConfig, 0, len(cfg.Nodes))
+		for _, node := range cfg.Nodes {
+			if node.Source == config.NodeSourceInline || node.Source == config.NodeSourceRetained {
+				inlineOrRetained = append(inlineOrRetained, node)
+			} else {
+				subOrFile = append(subOrFile, node)
+			}
+		}
+		if len(subOrFile) > 0 && cfg.SubscriptionRefresh.PreScreenEnabledFor(len(subOrFile)) {
+			res, psErr := prescreen.Filter(ctx, subOrFile, prescreen.Options{
+				Concurrency:    cfg.SubscriptionRefresh.PreScreenConcurrencyOrDefault(),
+				DNSTimeout:     cfg.SubscriptionRefresh.PreScreenTimeoutOrDefault(),
+				TCPTimeout:     cfg.SubscriptionRefresh.PreScreenTimeoutOrDefault(),
+				SkipCertVerify: cfg.SkipCertVerify,
+				Loggerf:        m.logger.Infof,
+			})
+			if psErr != nil {
+				if ctx.Err() != nil {
+					return ctx.Err()
+				}
+				m.logger.Warnf("startup pre-screen failed, keeping all %d nodes: %v", len(cfg.Nodes), psErr)
+			} else if len(res.Nodes) > 0 {
+				filtered := make([]config.NodeConfig, 0, len(inlineOrRetained)+len(res.Nodes))
+				filtered = append(filtered, inlineOrRetained...)
+				filtered = append(filtered, res.Nodes...)
+				m.mu.Lock()
+				cfg.Nodes = filtered
+				m.mu.Unlock()
+				if len(inlineOrRetained) > 0 {
+					m.logger.Infof("startup pre-screen active nodes: %d (%d filtered + %d inline/retained)", len(filtered), len(res.Nodes), len(inlineOrRetained))
+				}
+				// Sync filtered subscription nodes to disk so restart/mod-check baselines
+				// match memory; never overwrite manual nodes_file when subscriptions are empty.
+				filteredSubNodes := make([]config.NodeConfig, 0, len(res.Nodes))
+				for _, node := range res.Nodes {
+					if node.Source == config.NodeSourceSubscription {
+						filteredSubNodes = append(filteredSubNodes, node)
+					}
+				}
+				if len(filteredSubNodes) > 0 && len(cfg.Subscriptions) > 0 && cfg.NodesFile != "" {
+					if saveErr := config.WriteNodesToFile(cfg.NodesFile, filteredSubNodes); saveErr != nil {
+						m.logger.Warnf("failed to sync pre-screened nodes to %s: %v", cfg.NodesFile, saveErr)
+					}
+				}
+				if (cfg.Mode == "multi-port" || cfg.Mode == "hybrid") && cfg.FilePath() != "" {
+					if portErr := cfg.SaveNodePortMap(); portErr != nil {
+						m.logger.Warnf("failed to persist pruned node ports: %v", portErr)
+					}
+				}
+			} else {
+				m.logger.Warnf("startup pre-screen kept 0/%d nodes; falling back to original nodes", len(subOrFile))
+			}
+		}
+	}
+
 	var instance managedBox
 	var lastStartErr error
 	started := false
+	portReassigned := false
 	const maxRetries = 10
 	for retry := 0; retry < maxRetries; retry++ {
 		if err = ctx.Err(); err != nil {
@@ -169,6 +229,7 @@ func (m *Manager) Start(ctx context.Context) (err error) {
 				reassigned := reassignConflictingPort(cfg, conflictPort)
 				m.mu.Unlock()
 				if reassigned {
+					portReassigned = true
 					pool.ResetSharedStateStore()
 					m.monitorMgr.ClearNodes()
 					continue
@@ -186,6 +247,11 @@ func (m *Manager) Start(ctx context.Context) (err error) {
 		_ = instance.Close()
 		return err
 	}
+	if portReassigned && (cfg.Mode == "multi-port" || cfg.Mode == "hybrid") && cfg.FilePath() != "" {
+		if portErr := cfg.SaveNodePortMap(); portErr != nil {
+			m.logger.Warnf("failed to persist reassigned node ports: %v", portErr)
+		}
+	}
 	m.mu.Lock()
 	m.currentBox = instance
 	manager := m.monitorMgr
@@ -196,6 +262,10 @@ func (m *Manager) Start(ctx context.Context) (err error) {
 	m.mu.Unlock()
 	if startHealthCheck {
 		manager.StartPeriodicHealthCheck(periodicHealthInterval, periodicHealthTimeout)
+	}
+	m.logger.Infof("sing-box instance started with %d nodes", len(cfg.Nodes))
+	if cfg.GeoIP.Enabled {
+		m.startGeoIPRouter(ctx, cfg)
 	}
 	if cfg.SubscriptionRefresh.MinAvailableNodes > 0 {
 		timeout := cfg.SubscriptionRefresh.HealthCheckTimeout
@@ -208,13 +278,6 @@ func (m *Manager) Start(ctx context.Context) (err error) {
 			}
 			m.logger.Warnf("initial health check warning: %v", healthErr)
 		}
-	}
-	if err = ctx.Err(); err != nil {
-		return err
-	}
-	m.logger.Infof("sing-box instance started with %d nodes", len(cfg.Nodes))
-	if cfg.GeoIP.Enabled {
-		m.startGeoIPRouter(ctx, cfg)
 	}
 	return ctx.Err()
 }
@@ -249,7 +312,7 @@ func (m *Manager) reloadLocked(newCfg *config.Config) error {
 	}
 	oldBox := m.currentBox
 	oldCfg := m.cfg
-	m.currentBox = nil // Mark as reloading
+	useFactory := m.boxFactory != nil
 	m.mu.Unlock()
 
 	if ctx == nil {
@@ -258,8 +321,44 @@ func (m *Manager) reloadLocked(newCfg *config.Config) error {
 
 	m.logger.Infof("reloading with %d nodes", len(newCfg.Nodes))
 
+	oldProbeTarget := oldCfg.Management.ProbeTarget
+	oldSkipCert := oldCfg.SkipCertVerify
+	oldConcurrency := oldCfg.ProbeConcurrencyOrDefault()
+	sameProbeSettings := oldProbeTarget == newCfg.Management.ProbeTarget && oldSkipCert == newCfg.SkipCertVerify
+
+	restoreProbeSettings := func() {
+		if m.monitorMgr != nil {
+			m.monitorMgr.SetProbeConcurrency(oldConcurrency)
+			m.monitorMgr.SetProbeTarget(oldProbeTarget, oldSkipCert)
+		}
+	}
+
+	// Pre-build and pre-validate the replacement options before closing oldBox
+	// so invalid configs fail fast with zero downtime.
+	var preparedOpts option.Options
+	hasPreparedOpts := false
+	if !useFactory {
+		opts, err := m.prepareSingBoxOptions(ctx, newCfg)
+		if err != nil {
+			return fmt.Errorf("create new box: %w", err)
+		}
+		preparedOpts = opts
+		hasPreparedOpts = true
+	}
+
+	m.mu.Lock()
+	if m.closed {
+		m.mu.Unlock()
+		return errors.New("box manager closed")
+	}
+	if ctx.Err() != nil {
+		m.mu.Unlock()
+		return ctx.Err()
+	}
+	m.currentBox = nil // Mark as reloading only once replacement options are ready
+	m.mu.Unlock()
+
 	// For multi-port mode, we must close old instance first to release ports
-	// This causes a brief interruption but avoids port conflicts
 	if oldBox != nil {
 		m.logger.Infof("stopping old instance to release ports...")
 		if err := oldBox.Close(); err != nil {
@@ -276,21 +375,25 @@ func (m *Manager) reloadLocked(newCfg *config.Config) error {
 		_ = oldRouter.Stop()
 	}
 
-	// Give OS time to release ports
-	if err := waitForContext(ctx, 500*time.Millisecond); err != nil {
+	if err := ctx.Err(); err != nil {
 		return err
 	}
 
-	// Reset shared state store to ensure clean state for new config
-	pool.ResetSharedStateStore()
-
-	// Register the replacement nodes with any still-valid measurements for the
-	// same connection identity and probe settings.
+	var finishReload func()
 	if m.monitorMgr != nil {
-		if oldCfg.Management.ProbeTarget == newCfg.Management.ProbeTarget && oldCfg.SkipCertVerify == newCfg.SkipCertVerify {
-			finishReload := m.monitorMgr.BeginNodeReload()
+		m.monitorMgr.SetProbeConcurrency(newCfg.ProbeConcurrencyOrDefault())
+		m.monitorMgr.SetProbeTarget(newCfg.Management.ProbeTarget, newCfg.SkipCertVerify)
+	}
+	if sameProbeSettings {
+		// Keep active bans/cooldowns for surviving node identities across reload.
+		pool.RetainSharedStateForKeys(nodeIdentitySet(newCfg.Nodes))
+		if m.monitorMgr != nil {
+			finishReload = m.monitorMgr.BeginNodeReload()
 			defer finishReload()
-		} else {
+		}
+	} else {
+		pool.ResetSharedStateStore()
+		if m.monitorMgr != nil {
 			m.monitorMgr.ClearNodes()
 		}
 	}
@@ -299,13 +402,12 @@ func (m *Manager) reloadLocked(newCfg *config.Config) error {
 	//
 	// A bind conflict on start is almost always transient: the old box's
 	// listeners (the hybrid listener on 2323 and every per-node port on 24000+)
-	// were just closed and the OS has not yet released them. The fixed sleep
-	// above is a best-effort head start, not a guarantee. So on "address already
-	// in use" we WAIT and retry the SAME ports, keeping every preserved port
-	// stable across the refresh. Reassigning a node to a fresh port is a
-	// last-resort escape hatch (only once we've waited through several attempts):
-	// moving a port silently breaks clients pointed at the old one and is exactly
-	// the failure this guards against.
+	// were just closed and the OS may not yet have released them. On "address
+	// already in use" we use progressive backoff and retry the SAME ports,
+	// keeping every preserved port stable across the refresh. Reassigning a
+	// node to a fresh port is a last-resort escape hatch (only once we've waited
+	// through several attempts): moving a port silently breaks clients pointed
+	// at the old one and is exactly the failure this guards against.
 	var instance managedBox
 	started := false
 	var lastStartErr error
@@ -315,8 +417,16 @@ func (m *Manager) reloadLocked(newCfg *config.Config) error {
 			return err
 		}
 		var err error
-		instance, err = m.createInstance(ctx, newCfg)
+		if !useFactory && hasPreparedOpts {
+			instance, err = m.createBoxFromOptions(ctx, preparedOpts)
+		} else {
+			instance, err = m.createInstance(ctx, newCfg)
+		}
 		if err != nil {
+			if finishReload != nil {
+				finishReload()
+			}
+			restoreProbeSettings()
 			m.rollbackToOldConfig(ctx, oldCfg)
 			return fmt.Errorf("create new box: %w", err)
 		}
@@ -330,14 +440,19 @@ func (m *Manager) reloadLocked(newCfg *config.Config) error {
 		conflictPort := extractPortFromBindError(err)
 		if conflictPort == 0 {
 			// Not a port conflict: unrecoverable by retrying. Roll back now.
+			if finishReload != nil {
+				finishReload()
+			}
+			restoreProbeSettings()
 			m.rollbackToOldConfig(ctx, oldCfg)
 			return fmt.Errorf("start new box: %w", err)
 		}
 
-		// Give the OS more time to release the just-closed listener, then retry
-		// the same port assignment.
-		m.logger.Warnf("port %d still in use on start attempt %d/%d, waiting for release and retrying...", conflictPort, retry+1, maxRetries)
-		if err := waitForContext(ctx, 300*time.Millisecond); err != nil {
+		// Give the OS progressive time to release the just-closed listener,
+		// then retry the same port assignment.
+		backoff := min(300*time.Millisecond, 50*time.Millisecond*time.Duration(retry+1))
+		m.logger.Warnf("port %d still in use on start attempt %d/%d, waiting %s and retrying...", conflictPort, retry+1, maxRetries, backoff)
+		if err := waitForContext(ctx, backoff); err != nil {
 			return err
 		}
 
@@ -348,7 +463,12 @@ func (m *Manager) reloadLocked(newCfg *config.Config) error {
 		if retry >= maxRetries/2 {
 			if reassignConflictingPort(newCfg, conflictPort) {
 				m.logger.Warnf("port %d persistently in use; reassigned the affected node to a fresh port", conflictPort)
-				pool.ResetSharedStateStore()
+				if sameProbeSettings {
+					pool.RetainSharedStateForKeys(nodeIdentitySet(newCfg.Nodes))
+				} else {
+					pool.ResetSharedStateStore()
+				}
+				hasPreparedOpts = false
 			}
 		}
 	}
@@ -358,6 +478,10 @@ func (m *Manager) reloadLocked(newCfg *config.Config) error {
 		// so silently kills every port (2323 and all 24000+) with no error. Fall
 		// back to the previous configuration instead.
 		m.logger.Errorf("new box failed to start after %d attempts: %v", maxRetries, lastStartErr)
+		if finishReload != nil {
+			finishReload()
+		}
+		restoreProbeSettings()
 		m.rollbackToOldConfig(ctx, oldCfg)
 		return fmt.Errorf("start new box: exhausted %d attempts: %w", maxRetries, lastStartErr)
 	}
@@ -377,9 +501,14 @@ func (m *Manager) reloadLocked(newCfg *config.Config) error {
 		m.monitorServer.SetConfig(m.cfg)
 	}
 
-	// Trigger initial health check for newly registered nodes
+	// Probe only newly added/unchecked nodes when probe settings stayed unchanged;
+	// otherwise sweep everything immediately.
 	if m.monitorMgr != nil {
-		go m.monitorMgr.ProbeAllNow(periodicHealthTimeout)
+		if sameProbeSettings {
+			go m.monitorMgr.ProbeUncheckedNow(periodicHealthTimeout)
+		} else {
+			go m.monitorMgr.ProbeAllNow(periodicHealthTimeout)
+		}
 	}
 
 	m.logger.Infof("reload completed successfully with %d nodes", len(newCfg.Nodes))
@@ -613,23 +742,189 @@ func newBoxRecover(opts box.Options) (instance *box.Box, err error) {
 	return box.New(opts)
 }
 
-// createBox builds a sing-box instance from config.
-// It retries automatically when individual outbounds fail sing-box validation,
-// removing the offending outbound each time.
-func (m *Manager) createBox(ctx context.Context, cfg *config.Config) (*box.Box, error) {
+// prepareSingBoxOptions builds sing-box options and pre-validates proxy
+// outbounds in chunks before any running instance is stopped.
+func (m *Manager) prepareSingBoxOptions(ctx context.Context, cfg *config.Config) (option.Options, error) {
 	if cfg == nil {
-		return nil, errors.New("config is nil")
+		return option.Options{}, errors.New("config is nil")
 	}
+	opts, err := builder.Build(cfg)
+	if err != nil {
+		return option.Options{}, fmt.Errorf("build sing-box options: %w", err)
+	}
+	return prevalidateOptions(ctx, opts)
+}
+
+func newPrevalidateBoxContext(ctx context.Context) context.Context {
+	inboundRegistry := include.InboundRegistry()
+	outboundRegistry := include.OutboundRegistry()
+	endpointRegistry := include.EndpointRegistry()
+	dnsRegistry := include.DNSTransportRegistry()
+	serviceRegistry := include.ServiceRegistry()
+	return box.Context(ctx, inboundRegistry, outboundRegistry, endpointRegistry, dnsRegistry, serviceRegistry)
+}
+
+func isPrevalidateProxyOutbound(ob option.Outbound) bool {
+	switch ob.Type {
+	case pool.Type, C.TypeDirect, C.TypeBlock, C.TypeDNS, C.TypeSelector, C.TypeURLTest:
+		return false
+	default:
+		return true
+	}
+}
+
+// prevalidateOptions validates base proxy outbounds in side-effect-free chunks
+// (no listeners, pools, monitor, or ClashAPI) and strips any invalid ones in O(N).
+func prevalidateOptions(ctx context.Context, opts option.Options) (option.Options, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	proxyOutbounds := make([]option.Outbound, 0, len(opts.Outbounds))
+	for _, ob := range opts.Outbounds {
+		if isPrevalidateProxyOutbound(ob) {
+			proxyOutbounds = append(proxyOutbounds, ob)
+		}
+	}
+	if len(proxyOutbounds) == 0 {
+		return opts, nil
+	}
+
+	validateChunk := func(chunk []option.Outbound) error {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		boxCtx := newPrevalidateBoxContext(ctx)
+		instance, err := newBoxRecover(box.Options{
+			Context: boxCtx,
+			Options: option.Options{
+				Log:       &option.LogOptions{Disabled: true},
+				Outbounds: chunk,
+			},
+		})
+		if err == nil && instance != nil {
+			_ = instance.Close()
+		}
+		return err
+	}
+
+	var badTags map[string]struct{}
+	var isolateBad func([]option.Outbound) error
+	isolateBad = func(slice []option.Outbound) error {
+		if len(slice) == 0 {
+			return nil
+		}
+		err := validateChunk(slice)
+		if err == nil {
+			return nil
+		}
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return ctxErr
+		}
+		if len(slice) == 1 {
+			tag := slice[0].Tag
+			log.Printf("⚠️  Outbound '%s' failed sing-box validation: %v (removing)", tag, err)
+			if badTags == nil {
+				badTags = make(map[string]struct{})
+			}
+			badTags[tag] = struct{}{}
+			return nil
+		}
+		mid := len(slice) / 2
+		if err := isolateBad(slice[:mid]); err != nil {
+			return err
+		}
+		return isolateBad(slice[mid:])
+	}
+
+	const validationChunkSize = 64
+	for start := 0; start < len(proxyOutbounds); start += validationChunkSize {
+		end := min(start+validationChunkSize, len(proxyOutbounds))
+		if err := isolateBad(proxyOutbounds[start:end]); err != nil {
+			return option.Options{}, err
+		}
+	}
+
+	if len(badTags) == 0 {
+		return opts, nil
+	}
+	if len(badTags) >= len(proxyOutbounds) {
+		return option.Options{}, fmt.Errorf("create sing-box instance: all %d proxy outbounds failed validation", len(proxyOutbounds))
+	}
+
+	pruned, err := pruneOutboundsAndRoutes(opts, badTags)
+	if err != nil {
+		return option.Options{}, err
+	}
+	log.Printf("✅ Pre-validated outbounds: removed %d invalid outbound(s)", len(badTags))
+	return pruned, nil
+}
+
+func pruneOutboundsAndRoutes(opts option.Options, badTags map[string]struct{}) (option.Options, error) {
+	if len(badTags) == 0 {
+		return opts, nil
+	}
+	removedSet := make(map[string]struct{}, len(badTags))
+	for tag := range badTags {
+		removedSet[tag] = struct{}{}
+	}
+
+	newOutbounds := make([]option.Outbound, 0, len(opts.Outbounds))
+	for _, ob := range opts.Outbounds {
+		if _, isBad := badTags[ob.Tag]; isBad {
+			continue
+		}
+		if ob.Type == pool.Type {
+			if poolOpts, ok := ob.Options.(*pool.Options); ok {
+				filteredMembers := make([]string, 0, len(poolOpts.Members))
+				for _, m := range poolOpts.Members {
+					if _, isBad := badTags[m]; !isBad {
+						filteredMembers = append(filteredMembers, m)
+					}
+				}
+				poolOpts.Members = filteredMembers
+				for badTag := range badTags {
+					delete(poolOpts.Metadata, badTag)
+				}
+				if len(poolOpts.Members) == 0 {
+					log.Printf("⚠️  Removing empty pool '%s'", ob.Tag)
+					removedSet[ob.Tag] = struct{}{}
+					continue
+				}
+			}
+		}
+		newOutbounds = append(newOutbounds, ob)
+	}
+	if len(newOutbounds) == 0 {
+		return option.Options{}, errors.New("create sing-box instance: no valid outbounds remain")
+	}
+	opts.Outbounds = newOutbounds
+
+	if opts.Route != nil {
+		if _, removedFinal := removedSet[opts.Route.Final]; removedFinal {
+			return option.Options{}, fmt.Errorf("create sing-box instance: final outbound %q has no valid members", opts.Route.Final)
+		}
+		newRules := make([]option.Rule, 0, len(opts.Route.Rules))
+		for _, r := range opts.Route.Rules {
+			if r.Type == C.RuleTypeDefault {
+				outboundTarget := r.DefaultOptions.RuleAction.RouteOptions.Outbound
+				if _, removed := removedSet[outboundTarget]; removed {
+					continue
+				}
+			}
+			newRules = append(newRules, r)
+		}
+		opts.Route.Rules = newRules
+	}
+	return opts, nil
+}
+
+// createBoxFromOptions instantiates a sing-box Box from pre-validated options.
+func (m *Manager) createBoxFromOptions(ctx context.Context, opts option.Options) (*box.Box, error) {
 	if m.monitorMgr == nil {
 		return nil, errors.New("monitor manager not initialized")
 	}
 
-	opts, err := builder.Build(cfg)
-	if err != nil {
-		return nil, fmt.Errorf("build sing-box options: %w", err)
-	}
-
-	maxRetries := len(cfg.Nodes)*3 + 50 // Dynamically scale retries to configuration size
+	maxRetries := len(opts.Outbounds) + 50
 	outboundErrRe := regexp.MustCompile(`initialize outbound\[(\d+)\]`)
 
 	for attempt := 0; attempt <= maxRetries; attempt++ {
@@ -653,7 +948,6 @@ func (m *Manager) createBox(ctx context.Context, cfg *config.Config) (*box.Box, 
 			return instance, nil
 		}
 
-		// Check if this is an outbound initialization error we can recover from
 		matches := outboundErrRe.FindStringSubmatch(err.Error())
 		if matches == nil {
 			return nil, fmt.Errorf("create sing-box instance: %w", err)
@@ -667,103 +961,34 @@ func (m *Manager) createBox(ctx context.Context, cfg *config.Config) (*box.Box, 
 		badTag := opts.Outbounds[idx].Tag
 		log.Printf("⚠️  Outbound '%s' failed sing-box validation: %v (removing and retrying)", badTag, err)
 
-		// Remove the offending outbound
-		opts.Outbounds = append(opts.Outbounds[:idx], opts.Outbounds[idx+1:]...)
-
-		// Clean up pool outbounds that contained this tag
-		var newOutbounds []option.Outbound
-		var removedPoolTags []string
-		for _, ob := range opts.Outbounds {
-			if ob.Type == pool.Type {
-				if poolOpts, ok := ob.Options.(*pool.Options); ok {
-					poolOpts.Members = removeFromSlice(poolOpts.Members, badTag)
-					delete(poolOpts.Metadata, badTag)
-
-					// If the pool is now empty, remove it to avoid another validation error
-					if len(poolOpts.Members) == 0 {
-						log.Printf("⚠️  Removing empty pool '%s'", ob.Tag)
-						removedPoolTags = append(removedPoolTags, ob.Tag)
-						continue // skip adding this empty pool
-					}
-				}
-			}
-			newOutbounds = append(newOutbounds, ob)
-		}
-		opts.Outbounds = newOutbounds
-
-		// Also remove any routes that pointed to the removed pools or the badTag
-		if (len(removedPoolTags) > 0 || badTag != "") && opts.Route != nil {
-			removedSet := make(map[string]bool)
-			for _, t := range removedPoolTags {
-				removedSet[t] = true
-			}
-			removedSet[badTag] = true
-
-			var newRules []option.Rule
-			for _, r := range opts.Route.Rules {
-				// We expect DefaultRules in our builder
-				if r.Type == C.RuleTypeDefault {
-					outboundTarget := r.DefaultOptions.RuleAction.RouteOptions.Outbound
-					if !removedSet[outboundTarget] {
-						newRules = append(newRules, r)
-					} else {
-						// Remove this rule since it points to a deleted outbound
-					}
-				} else {
-					newRules = append(newRules, r)
-				}
-			}
-			opts.Route.Rules = newRules
+		opts, err = pruneOutboundsAndRoutes(opts, map[string]struct{}{badTag: {}})
+		if err != nil {
+			return nil, err
 		}
 	}
 
 	return nil, fmt.Errorf("create sing-box instance: too many invalid outbounds (exceeded %d retries)", maxRetries)
 }
 
-// gracefulSwitch swaps the current box with a new one.
-func (m *Manager) gracefulSwitch(newBox *box.Box) error {
-	if newBox == nil {
-		return errors.New("new box is nil")
+// createBox builds and instantiates a sing-box instance from config.
+func (m *Manager) createBox(ctx context.Context, cfg *config.Config) (*box.Box, error) {
+	if m.monitorMgr == nil {
+		return nil, errors.New("monitor manager not initialized")
 	}
-
-	m.mu.Lock()
-	old := m.currentBox
-	m.currentBox = newBox
-	drainTimeout := m.drainTimeout
-	m.mu.Unlock()
-
-	if old != nil {
-		go m.drainOldBox(old, drainTimeout)
+	opts, err := m.prepareSingBoxOptions(ctx, cfg)
+	if err != nil {
+		return nil, err
 	}
-
-	m.logger.Infof("switched to new instance, draining old for %s", drainTimeout)
-	return nil
+	return m.createBoxFromOptions(ctx, opts)
 }
 
-// drainOldBox waits for drain timeout then closes the old box.
-func (m *Manager) drainOldBox(oldBox managedBox, timeout time.Duration) {
-	if oldBox == nil {
-		return
+func nodeIdentitySet(nodes []config.NodeConfig) map[string]struct{} {
+	keep := make(map[string]struct{}, len(nodes))
+	for i := range nodes {
+		sum := sha256.Sum256([]byte(nodes[i].NodeKey()))
+		keep[fmt.Sprintf("%x", sum)] = struct{}{}
 	}
-	if timeout > 0 {
-		time.Sleep(timeout)
-	}
-	if err := oldBox.Close(); err != nil {
-		m.logger.Errorf("failed to close old instance: %v", err)
-		return
-	}
-	m.logger.Infof("old instance closed after %s drain", timeout)
-}
-
-// removeFromSlice removes an element from a string slice.
-func removeFromSlice(slice []string, element string) []string {
-	result := make([]string, 0, len(slice))
-	for _, s := range slice {
-		if s != element {
-			result = append(result, s)
-		}
-	}
-	return result
+	return keep
 }
 
 // waitForHealthCheck polls until enough nodes are available or timeout.
@@ -1165,6 +1390,10 @@ func (m *Manager) CurrentSubscriptionConfig() *config.Config {
 		Subscriptions:       append([]string(nil), m.cfg.Subscriptions...),
 		SubscriptionRefresh: m.cfg.SubscriptionRefresh,
 	}
+	if m.cfg.SubscriptionRefresh.PreScreenEnabled != nil {
+		value := *m.cfg.SubscriptionRefresh.PreScreenEnabled
+		snapshot.SubscriptionRefresh.PreScreenEnabled = &value
+	}
 	snapshot.SetFilePath(m.cfg.FilePath())
 	return snapshot
 }
@@ -1286,6 +1515,14 @@ func (m *Manager) copyConfigLocked() *config.Config {
 	if m.cfg.Sticky.SessionEnabled != nil {
 		value := *m.cfg.Sticky.SessionEnabled
 		cloned.Sticky.SessionEnabled = &value
+	}
+	if m.cfg.SubscriptionRefresh.PreScreenEnabled != nil {
+		value := *m.cfg.SubscriptionRefresh.PreScreenEnabled
+		cloned.SubscriptionRefresh.PreScreenEnabled = &value
+	}
+	if len(m.cfg.DNS.FallbackServers) > 0 {
+		cloned.DNS.FallbackServers = make([]string, len(m.cfg.DNS.FallbackServers))
+		copy(cloned.DNS.FallbackServers, m.cfg.DNS.FallbackServers)
 	}
 	// Clone Subscriptions slice to avoid shared backing array issues
 	if len(m.cfg.Subscriptions) > 0 {

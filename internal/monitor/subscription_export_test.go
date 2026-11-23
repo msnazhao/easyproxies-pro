@@ -348,14 +348,28 @@ func TestExitSubscriptionIncludesNodeAfterTrafficTriggersRecheck(t *testing.T) {
 		return result.Body.String()
 	}
 	since := time.Now().Add(-5 * time.Minute)
-	m.probeNodes(time.Second, since)
+	m.probeNodes(time.Second, since, false)
 	if attempts != 1 || strings.Contains(read(), "._ip_1.1.1.1") {
 		t.Fatal("unverified exit appeared in the subscription")
 	}
 	pending.IncActive()
 	pending.DecActive()
-	m.probeNodes(time.Second, since)
+	m.probeNodes(time.Second, since, false)
 	if attempts != 2 || !strings.Contains(read(), "._ip_1.1.1.1") {
 		t.Fatalf("exit did not recover after traffic: attempts=%d", attempts)
+	}
+}
+
+func TestExitSubscriptionUnavailableIncludesReason(t *testing.T) {
+	cfg := proxySessionTestConfig()
+	cfg.Listener.Username = ""
+	s, _ := newProxySessionTestServer(t, cfg)
+	result := proxyAPIRequest(t, s, http.MethodGet, "/sub/proxies2", "")
+	if result.Code != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d, want 503", result.Code)
+	}
+	body := result.Body.String()
+	if !strings.Contains(body, "exit IP sessions unavailable:") || !strings.Contains(body, "用户名") {
+		t.Fatalf("expected actionable reason in body, got %q", body)
 	}
 }

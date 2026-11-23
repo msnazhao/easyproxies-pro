@@ -60,6 +60,17 @@ func (c *Config) ValidateManagementSettings() error {
 	if c.Management.ProbeConcurrency < 0 || c.Management.ProbeConcurrency > 1024 {
 		return fmt.Errorf("management.probe_concurrency must be from 1 to 1024 or 0 for default")
 	}
+	if c.SubscriptionRefresh.PreScreenConcurrency < 0 || c.SubscriptionRefresh.PreScreenConcurrency > 1024 {
+		return fmt.Errorf("subscription_refresh.prescreen_concurrency must be from 1 to 1024 or 0 for default")
+	}
+	if c.SubscriptionRefresh.PreScreenTimeout < 0 {
+		return fmt.Errorf("subscription_refresh.prescreen_timeout must not be negative")
+	}
+	switch strings.ToLower(strings.TrimSpace(c.DNS.Strategy)) {
+	case "", "as_is", "prefer_ipv4", "prefer_ipv6", "ipv4_only", "ipv6_only":
+	default:
+		return fmt.Errorf("dns.strategy must be as_is, prefer_ipv4, prefer_ipv6, ipv4_only or ipv6_only")
+	}
 	if c.Sticky.SessionTTL < 0 || c.Sticky.SessionTTL > MaxSessionTTL {
 		return fmt.Errorf("sticky.session_ttl must be positive and at most %s", MaxSessionTTL)
 	}

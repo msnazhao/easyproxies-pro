@@ -1,16 +1,30 @@
 package monitor
 
 import (
+	"encoding/base64"
+	"encoding/json"
 	"fmt"
+	"net"
 	"net/url"
+	"strconv"
 	"strings"
 )
 
 // nodeBrief extracts a credential-free "scheme@host:port" summary from a node
-// URI for log lines. Credentials in the URI are dropped. Returns "" when the
-// URI cannot be parsed (e.g. base64-encoded vmess links).
+// URI for log lines. Credentials in the URI are dropped, and base64-encoded
+// VMess links extract only host:port without dumping base64/UUIDs.
 func nodeBrief(uri string) string {
+	uri = strings.TrimSpace(uri)
 	if uri == "" {
+		return ""
+	}
+	lower := strings.ToLower(uri)
+	switch {
+	case strings.HasPrefix(lower, "vmess://") && !strings.Contains(uri, "@"):
+		return vmessBrief(uri)
+	case strings.HasPrefix(lower, "ssr://"), strings.HasPrefix(lower, "shadowsocksr://"):
+		return ""
+	case (strings.HasPrefix(lower, "ss://") || strings.HasPrefix(lower, "shadowsocks://")) && !strings.Contains(uri, "@"):
 		return ""
 	}
 	u, err := url.Parse(uri)
@@ -22,9 +36,51 @@ func nodeBrief(uri string) string {
 		return ""
 	}
 	if port := u.Port(); port != "" {
-		return fmt.Sprintf("%s@%s:%s", u.Scheme, host, port)
+		return fmt.Sprintf("%s@%s", u.Scheme, net.JoinHostPort(host, port))
 	}
 	return fmt.Sprintf("%s@%s", u.Scheme, host)
+}
+
+func vmessBrief(uri string) string {
+	payload := strings.TrimPrefix(uri, "vmess://")
+	if idx := strings.Index(payload, "#"); idx != -1 {
+		payload = payload[:idx]
+	}
+	payload = strings.TrimSpace(payload)
+	var decoded []byte
+	var err error
+	for _, enc := range []*base64.Encoding{base64.StdEncoding, base64.RawStdEncoding, base64.URLEncoding, base64.RawURLEncoding} {
+		decoded, err = enc.DecodeString(payload)
+		if err == nil {
+			break
+		}
+	}
+	if err != nil {
+		return ""
+	}
+	var fields struct {
+		Add  string `json:"add"`
+		Port any    `json:"port"`
+	}
+	if json.Unmarshal(decoded, &fields) != nil || strings.TrimSpace(fields.Add) == "" {
+		return ""
+	}
+	host := strings.TrimSpace(fields.Add)
+	var portStr string
+	switch v := fields.Port.(type) {
+	case float64:
+		if v > 0 {
+			portStr = strconv.Itoa(int(v))
+		}
+	case string:
+		if p, convErr := strconv.Atoi(strings.TrimSpace(v)); convErr == nil && p > 0 {
+			portStr = strconv.Itoa(p)
+		}
+	}
+	if portStr != "" {
+		return fmt.Sprintf("vmess@%s", net.JoinHostPort(host, portStr))
+	}
+	return fmt.Sprintf("vmess@%s", host)
 }
 
 // classifyProbeError maps a raw probe error to a stable category code and a
